@@ -33,7 +33,7 @@ public class CustomerManager : MonoBehaviour
     private void TrySpawnCustomerGroup()
     {
         // 1. Генерируем случайный размер группы от 1 до 4 человек
-        int groupSize = Random.Range(1, 5); 
+        int groupSize = Random.Range(2, 2); 
 
         // 2. Ищем стол, который может принять группу целиком
         DiningTable targetTable = null;

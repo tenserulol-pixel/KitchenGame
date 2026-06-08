@@ -82,7 +82,6 @@ public class CustomerAI : MonoBehaviour
         }
     }
 
-    // МЕТОД ОБЪЕДИНЕН И ЗАЩИЩЕН (ДУБЛИКАТ УДАЛЕН)
     public void ShowIndividualOrder()
     {
         // ПРОВЕРКА 1: Выбрал ли клиент рецепт заранее?
@@ -131,7 +130,14 @@ public class CustomerAI : MonoBehaviour
             Destroy(orderVisualInstance);
         }
 
-        LeaveTable();
+        // Запускаем анимацию еды, если она есть
+        if (animator != null)
+        {
+            animator.SetTrigger("Eat"); 
+        }
+
+        // Внимание: мы НЕ вызываем здесь LeaveTable() мгновенно!
+        // Стол сам скомандует уйти после окончания таймера поедания.
     }
 
     public void LeaveTable()
@@ -147,6 +153,10 @@ public class CustomerAI : MonoBehaviour
         }
 
         agent.enabled = true;
+        
+        // Отправляем ИИ к выходу (координаты 0,0,0 или точка спавна)
+        agent.SetDestination(Vector3.zero);
+
         Destroy(gameObject, 2f); 
     }
 }
