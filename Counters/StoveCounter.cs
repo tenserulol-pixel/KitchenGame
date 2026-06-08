@@ -90,61 +90,64 @@ private void Update()
 }
         
 public override void Interact(Player player)
+{
+    if (!HasKitchenObject())
     {
-        if(!HasKitchenObject()){
-            if(player.HasKitchenObject()){
-                if(HasRecipeWithInput(player.GetKitchenObject().GetKitchenObjectSo())){
-                player.GetKitchenObject().SetKitchenObjectParent(this);
-                fryingRecipeSO=GetFryingRecipeSOWithInput(GetKitchenObject().GetKitchenObjectSo());  
-                state=State.Frying;
-                fryingTimer=0f;
-                 OnStateChanged?.Invoke(this,new OnStateChangedEventArgs
+        // На плите ничего нет
+        if (player.HasKitchenObject())
+        {
+            // У игрока что-то есть. Проверяем, есть ли рецепт для этого объекта,
+            // И исключаем возможность положить саму тарелку на плиту.
+            if (HasRecipeWithInput(player.GetKitchenObject().GetKitchenObjectSo()))
+            {
+                // Дополнительная проверка: если у объекта есть компонент тарелки, не даем его положить
+                if (!player.GetKitchenObject().TryGetPlate(out _))
                 {
-                    state=state
-                });
-                }
-                //player carry smth that can be Fried
-                
-            }else{
-                //player has nothing
-            }
-            //NoObject
-        }else{
-            //Object
-            if(player.HasKitchenObject()){
-                if(player.GetKitchenObject().TryGetPlate(out PlateKitchenObject plateKitchenObject))
-                {
-                        //player holding plate
-                    if(plateKitchenObject.AddIngredient(GetKitchenObject().GetKitchenObjectSo())){
-                       GetKitchenObject().DestroySelf();
-                       state=State.Idle;
-                    OnStateChanged?.Invoke(this,new OnStateChangedEventArgs
-                    {
-                        state=state
-                    });
-                    OnProgressChanged?.Invoke(this,new IHasProgress.OnProgressChangedEventArgs
-                    {
-                    progressNormalized=0f
-                    }); 
-                    }
+                    player.GetKitchenObject().SetKitchenObjectParent(this);
                     
+                    fryingRecipeSO = GetFryingRecipeSOWithInput(GetKitchenObject().GetKitchenObjectSo());
+                    state = State.Frying;
+                    fryingTimer = 0f;
+
+                    OnStateChanged?.Invoke(this, new OnStateChangedEventArgs { state = state });
+                    OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs {
+                        progressNormalized = fryingTimer / fryingRecipeSO.fryingTimerMax
+                    });
                 }
-                //player carry smth
-            }else{
-                //player not carry anything
-                GetKitchenObject().SetKitchenObjectParent(player);
-                state=State.Idle;
-                 OnStateChanged?.Invoke(this,new OnStateChangedEventArgs
-                {
-                    state=state
-                });
-                OnProgressChanged?.Invoke(this,new IHasProgress.OnProgressChangedEventArgs
-                {
-                   progressNormalized=0f
-                });
             }
         }
     }
+    else
+    {
+        // На плите что-то лежит
+        if (player.HasKitchenObject())
+        {
+            // Игрок держит что-то в руках (например, тарелку)
+            if (player.GetKitchenObject().TryGetPlate(out PlateKitchenObject plateKitchenObject))
+            {
+                // Пытаемся добавить то, что на плите, в тарелку игрока
+                if (plateKitchenObject.AddIngredient(GetKitchenObject().GetKitchenObjectSo()))
+                {
+                    GetKitchenObject().DestroySelf();
+
+                    // Сбрасываем плиту в исходное состояние
+                    state = State.Idle;
+                    OnStateChanged?.Invoke(this, new OnStateChangedEventArgs { state = state });
+                    OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs { progressNormalized = 0f });
+                }
+            }
+        }
+        else
+        {
+            // У игрока пустые руки — просто забираем объект с плиты
+            GetKitchenObject().SetKitchenObjectParent(player);
+
+            state = State.Idle;
+            OnStateChanged?.Invoke(this, new OnStateChangedEventArgs { state = state });
+            OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs { progressNormalized = 0f });
+        }
+    }
+}
     private bool HasRecipeWithInput(KitchenObjectSO inputkitchenObjectSO){
         FryingRecipeSO fryingRecipeSO=GetFryingRecipeSOWithInput(inputkitchenObjectSO);
         return fryingRecipeSO != null;
