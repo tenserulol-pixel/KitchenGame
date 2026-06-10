@@ -83,7 +83,7 @@ public class Player : MonoBehaviour,IKitchenObjectParent
             SetSelectedCounter(null);
         }
 
-    
+    Debug.DrawRay(transform.position, lastInteractDir * interactDistance, Color.red, 0.1f);
     }
     private void HandleMovement(){
         Vector2 inputVector=gameInput.GetMovementVectorNormalized();

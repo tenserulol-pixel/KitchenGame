@@ -83,7 +83,10 @@ public class SinkCounter : BaseCounter, IHasProgress
             }
         }
     }
-
+private void OnMouseOver()
+{
+    Debug.Log("Мышь над раковиной!"); // Не сработает без коллайдера
+}
     public override void InteractAlternate(Player player)
     {
         // Проверяем, лежит ли в раковине именно грязная тарелка
