@@ -55,7 +55,34 @@ public class GridPositioningSystem : MonoBehaviour
     }
 
     /// <summary>
-    /// Пытается разместить счетчик/стол на сетке.
+    /// Регистрирует объект на его текущей позиции и выравнивает по сетке.
+    /// Полезно для объектов, которые изначально расставлены на сцене в редакторе Unity.
+    /// </summary>
+    public void RegisterCounterAtCurrentPosition(BaseCounter counter)
+    {
+        Vector2Int gridPos = GetGridPosition(counter.transform.position);
+
+        if (IsCellOccupied(gridPos))
+        {
+            // Проверяем: если ячейку занял тот же самый объект, игнорируем ошибку
+            if (occupiedCells[gridPos] == counter) return;
+
+            Debug.LogWarning($"[GridSystem] Конфликт! Ячейка {gridPos} уже занята объектом '{occupiedCells[gridPos].gameObject.name}'. Не удалось зарегистрировать '{counter.gameObject.name}'");
+            return;
+        }
+
+        // Выравниваем объект строго по центру ячейки
+        Vector3 alignedPosition = GetWorldPosition(gridPos);
+        alignedPosition.y = counter.transform.position.y; // Сохраняем исходную высоту стола
+        counter.transform.position = alignedPosition;
+
+        // Бронируем ячейку за этим столом
+        occupiedCells[gridPos] = counter;
+        Debug.Log($"[GridSystem] '{counter.gameObject.name}' автоматически выровнен и зарегистрирован в ячейке {gridPos}");
+    }
+
+    /// <summary>
+    /// Пытается разместить счетчик/стол на сетке (например, при покупке стола).
     /// </summary>
     /// <returns>True, если размещение успешно. False, если ячейка занята.</returns>
     public bool TryPlaceCounter(BaseCounter counter, Vector3 targetWorldPosition)
@@ -71,7 +98,7 @@ public class GridPositioningSystem : MonoBehaviour
         // Выравниваем объект по центру сетки
         Vector3 alignedPosition = GetWorldPosition(gridPos);
         
-        // Корректируем высоту под объект (например, оставляем исходную высоту стола)
+        // Корректируем высоту под объект
         alignedPosition.y = counter.transform.position.y; 
         counter.transform.position = alignedPosition;
 

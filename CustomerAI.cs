@@ -4,10 +4,10 @@ using UnityEngine.AI;
 [RequireComponent(typeof(NavMeshAgent))]
 public class CustomerAI : MonoBehaviour
 {
-    [Header("Список доступных рецептов (Меню)")]
+    [Header("Настройки меню")]
     [SerializeField] private RecipeListSO recipeListSO; 
 
-    [Header("UI заказа над головой")]
+    [Header("Облачко заказа")]
     [SerializeField] private Transform orderVisualPrefab; 
 
     private NavMeshAgent agent;
@@ -16,7 +16,7 @@ public class CustomerAI : MonoBehaviour
     private DiningTable diningTable;
     private bool isSeated = false;
 
-    private RecipeSO orderedRecipe; // Выбранное блюдо
+    private RecipeSO orderedRecipe; 
     private GameObject orderVisualInstance;
 
     private void Awake()
@@ -61,7 +61,6 @@ public class CustomerAI : MonoBehaviour
             transform.rotation = Quaternion.LookRotation(tableDirection);
         }
 
-        // Заранее тихо выбираем рецепт, который захочет этот клиент
         PreSelectRecipe();
 
         if (diningTable != null)
@@ -74,40 +73,19 @@ public class CustomerAI : MonoBehaviour
     {
         if (recipeListSO != null && recipeListSO.recipeSOList != null && recipeListSO.recipeSOList.Count > 0)
         {
-            orderedRecipe = recipeListSO.recipeSOList[Random.Range(0, recipeListSO.recipeSOList.Count)];
-        }
-        else
-        {
-            Debug.LogError($"[CustomerAI] На объекте {gameObject.name} не назначен RecipeListSO или список рецептов пуст!", gameObject);
+            orderedRecipe = recipeListSO.recipeSOList[UnityEngine.Random.Range(0, recipeListSO.recipeSOList.Count)];
         }
     }
 
     public void ShowIndividualOrder()
     {
-        // ПРОВЕРКА 1: Выбрал ли клиент рецепт заранее?
-        if (orderedRecipe == null)
-        {
-            Debug.LogError($"[CustomerAI] У клиента {gameObject.name} не выбран рецепт! Проверьте, заполнен ли ScriptableObject меню.", gameObject);
-            return;
-        }
+        if (orderedRecipe == null || orderVisualPrefab == null) return;
 
-        // ПРОВЕРКА 2: Назначен ли префаб облачка заказа?
-        if (orderVisualPrefab == null)
-        {
-            Debug.LogError($"[CustomerAI] На префабе клиента {gameObject.name} отсутствует ссылка на 'Order Visual Prefab' в инспекторе!", gameObject);
-            return;
-        }
-
-        // Спавним UI над головой (теперь безопасно берем orderVisualPrefab.gameObject)
         orderVisualInstance = Instantiate(orderVisualPrefab.gameObject, transform.position + Vector3.up * 4f, Quaternion.identity, transform);
         
         if (orderVisualInstance.TryGetComponent<DeliveryManagerSingleUI>(out var orderUI))
         {
             orderUI.SetRecipeSO(orderedRecipe);
-        }
-        else
-        {
-            Debug.LogError($"[CustomerAI] На спавнящемся префабе {orderVisualPrefab.name} не найден компонент DeliveryManagerSingleUI!", orderVisualPrefab);
         }
         
         if (!orderVisualInstance.GetComponent<LookAtCamera>())
@@ -116,10 +94,7 @@ public class CustomerAI : MonoBehaviour
         }
     }
 
-    public RecipeSO GetOrderedRecipe()
-    {
-        return orderedRecipe;
-    }
+    public RecipeSO GetOrderedRecipe() => orderedRecipe;
 
     public void DeliverOrder()
     {
@@ -130,14 +105,10 @@ public class CustomerAI : MonoBehaviour
             Destroy(orderVisualInstance);
         }
 
-        // Запускаем анимацию еды, если она есть
         if (animator != null)
         {
-            animator.SetTrigger("Eat"); 
+            animator.SetTrigger("Eat"); // Запуск анимации поедания в Unity Animator
         }
-
-        // Внимание: мы НЕ вызываем здесь LeaveTable() мгновенно!
-        // Стол сам скомандует уйти после окончания таймера поедания.
     }
 
     public void LeaveTable()
@@ -153,10 +124,24 @@ public class CustomerAI : MonoBehaviour
         }
 
         agent.enabled = true;
-        
-        // Отправляем ИИ к выходу (координаты 0,0,0 или точка спавна)
-        agent.SetDestination(Vector3.zero);
+        agent.SetDestination(Vector3.zero); // Направление к выходу
 
         Destroy(gameObject, 2f); 
+    }
+
+    public void LeaveTableAngry()
+    {
+        if (diningTable != null)
+        {
+            diningTable.OnCustomerLeft(this);
+        }
+
+        // Вычитаем золото за проваленный заказ из кошелька игрока
+        if (GameLoopManager.Instance != null)
+        {
+            GameLoopManager.Instance.DeductOrderGold();
+        }
+
+        LeaveTable();
     }
 }
