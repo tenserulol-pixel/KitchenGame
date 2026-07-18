@@ -9,6 +9,11 @@ public class Chair : MonoBehaviour
         return currentCustomer == null;
     }
 
+    public bool IsOccupied()
+    {
+        return currentCustomer != null;
+    }
+
     public void SetCustomer(CustomerAI customer)
     {
         currentCustomer = customer;
@@ -17,6 +22,11 @@ public class Chair : MonoBehaviour
     public void ClearCustomer()
     {
         currentCustomer = null;
+    }
+
+    public CustomerAI GetCustomer()
+    {
+        return currentCustomer;
     }
 
     public Vector3 GetPosition()

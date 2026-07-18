@@ -1,22 +1,43 @@
 using UnityEngine;
 using UnityEngine.AI;
+using System;
 
 [RequireComponent(typeof(NavMeshAgent))]
 public class CustomerAI : MonoBehaviour
 {
-    [Header("Настройки меню")]
-    [SerializeField] private RecipeListSO recipeListSO; 
+    public enum CustomerState
+    {
+        Walking,
+        Sitting,
+        WaitingForFood,
+        Eating,
+        FinishedEating, // Ожидание окончания трапезы остальными членами группы
+        Leaving
+    }
 
-    [Header("Облачко заказа")]
-    [SerializeField] private Transform orderVisualPrefab; 
+    public event EventHandler OnStateChanged;
+
+    [Header("Настройки времени")]
+    [SerializeField] private float eatingTime = 10f;
+    [SerializeField] private float maxPatience = 60f;
+
+    [Header("Заказы")]
+    [SerializeField] private RecipeListSO recipeListSO;
+    [SerializeField] private Transform orderVisualPrefab;
 
     private NavMeshAgent agent;
     private Animator animator;
+
     private Chair targetChair;
     private DiningTable diningTable;
-    private bool isSeated = false;
 
-    private RecipeSO orderedRecipe; 
+    private CustomerState state;
+
+    private RecipeSO orderedRecipe;
+
+    private float patienceTimer;
+    private float eatingTimer;
+
     private GameObject orderVisualInstance;
 
     private void Awake()
@@ -25,78 +46,170 @@ public class CustomerAI : MonoBehaviour
         animator = GetComponentInChildren<Animator>();
     }
 
+    private void Start()
+    {
+        SetState(CustomerState.Walking);
+    }
+
     private void Update()
     {
-        if (animator != null)
-        {
-            float currentSpeed = agent.remainingDistance > 0.1f ? agent.speed : 0f;
-            animator.SetFloat("Speed", currentSpeed);
-        }
+        HandleAnimation();
 
-        if (!isSeated && targetChair != null && agent.remainingDistance <= 0.2f && !agent.pathPending)
+        switch (state)
+        {
+            case CustomerState.Walking:
+                UpdateWalking();
+                break;
+
+            case CustomerState.WaitingForFood:
+                UpdateWaiting();
+                break;
+
+            case CustomerState.Eating:
+                UpdateEating();
+                break;
+
+            case CustomerState.FinishedEating:
+                // В этом состоянии гость спокойно сидит на стуле и ждет остальных членов группы
+                break;
+
+            case CustomerState.Leaving:
+                break;
+        }
+    }
+
+    private void HandleAnimation()
+    {
+        if (animator == null) return;
+
+        animator.SetFloat(
+            "Speed",
+            agent.enabled ? agent.velocity.magnitude : 0f
+        );
+    }
+
+    private void UpdateWalking()
+    {
+        if (targetChair == null)
+            return;
+
+        // Защита: Проверяем, запечен ли NavMesh
+        if (agent.enabled && !agent.pathPending && agent.remainingDistance <= 0.2f)
         {
             SitDown();
         }
     }
 
+    private void UpdateWaiting()
+    {
+        patienceTimer -= Time.deltaTime;
+
+        if (patienceTimer <= 0)
+        {
+            LeaveTableAngry();
+        }
+    }
+
+    private void UpdateEating()
+    {
+        eatingTimer -= Time.deltaTime;
+
+        if (eatingTimer <= 0)
+        {
+            // Переходим в состояние ожидания всей группы вместо мгновенного самостоятельного ухода
+            SetState(CustomerState.FinishedEating);
+            if (diningTable != null)
+            {
+                diningTable.OnCustomerFinishedEating(this);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Устанавливает стул и стол-цель для данного клиента и отправляет его туда.
+    /// </summary>
     public void SetTargetSeat(Chair chair, DiningTable table)
     {
         targetChair = chair;
         diningTable = table;
-        targetChair.SetCustomer(this);
-        
-        agent.enabled = true;
-        agent.SetDestination(chair.GetPosition());
+
+        if (targetChair != null)
+        {
+            targetChair.SetCustomer(this);
+        }
+
+        // Перед установкой назначения проверяем, активен ли агент навигации
+        if (agent != null)
+        {
+            agent.enabled = true;
+            if (agent.isOnNavMesh)
+            {
+                agent.SetDestination(chair.GetPosition());
+            }
+            else
+            {
+                Debug.LogWarning($"[CustomerAI] Объект {name} заспавнился вне сетки NavMesh! Пожалуйста, запеките навигацию (Navigation window).");
+                // Тест-телепортация к стулу, чтобы игра не ломалась, если сетка не запечена
+                transform.position = chair.GetPosition();
+            }
+        }
     }
 
     private void SitDown()
     {
-        isSeated = true;
-        agent.enabled = false;
+        SetState(CustomerState.Sitting);
 
-        Vector3 tableDirection = diningTable.transform.position - transform.position;
-        tableDirection.y = 0;
-        if (tableDirection != Vector3.zero)
+        if (agent != null)
         {
-            transform.rotation = Quaternion.LookRotation(tableDirection);
+            agent.enabled = false;
         }
 
-        PreSelectRecipe();
+        Vector3 direction = diningTable.transform.position - transform.position;
+        direction.y = 0;
 
-        if (diningTable != null)
+        if (direction != Vector3.zero)
         {
-            diningTable.CustomerSeated();
+            transform.rotation = Quaternion.LookRotation(direction);
         }
+
+        SelectRecipe();
+
+        patienceTimer = maxPatience;
+
+        diningTable.CustomerSeated(this);
+
+        ShowOrder();
+
+        // Регистрируем заказ в менеджере доставки
+        if (DeliveryManager.Instance != null && orderedRecipe != null)
+        {
+            DeliveryManager.Instance.AddOrderFromTable(orderedRecipe, diningTable);
+        }
+
+        SetState(CustomerState.WaitingForFood);
     }
 
-    private void PreSelectRecipe()
+    private void SelectRecipe()
     {
-        if (recipeListSO != null && recipeListSO.recipeSOList != null && recipeListSO.recipeSOList.Count > 0)
-        {
-            orderedRecipe = recipeListSO.recipeSOList[UnityEngine.Random.Range(0, recipeListSO.recipeSOList.Count)];
-        }
+        if (recipeListSO == null || recipeListSO.recipeSOList.Count == 0)
+            return;
+
+        orderedRecipe = recipeListSO.recipeSOList[UnityEngine.Random.Range(0, recipeListSO.recipeSOList.Count)];
     }
 
-    public void ShowIndividualOrder()
+    public bool TryDeliver(RecipeSO recipeSO)
     {
-        if (orderedRecipe == null || orderVisualPrefab == null) return;
+        if (state != CustomerState.WaitingForFood)
+            return false;
 
-        orderVisualInstance = Instantiate(orderVisualPrefab.gameObject, transform.position + Vector3.up * 4f, Quaternion.identity, transform);
-        
-        if (orderVisualInstance.TryGetComponent<DeliveryManagerSingleUI>(out var orderUI))
-        {
-            orderUI.SetRecipeSO(orderedRecipe);
-        }
-        
-        if (!orderVisualInstance.GetComponent<LookAtCamera>())
-        {
-            orderVisualInstance.AddComponent<LookAtCamera>();
-        }
+        if (orderedRecipe != recipeSO)
+            return false;
+
+        DeliverOrder();
+        return true;
     }
 
-    public RecipeSO GetOrderedRecipe() => orderedRecipe;
-
-    public void DeliverOrder()
+    private void DeliverOrder()
     {
         orderedRecipe = null;
 
@@ -107,15 +220,44 @@ public class CustomerAI : MonoBehaviour
 
         if (animator != null)
         {
-            animator.SetTrigger("Eat"); // Запуск анимации поедания в Unity Animator
+            animator.SetTrigger("Eat");
+        }
+
+        eatingTimer = eatingTime;
+        SetState(CustomerState.Eating);
+    }
+
+    private void ShowOrder()
+    {
+        if (orderVisualPrefab == null || orderedRecipe == null)
+            return;
+
+        orderVisualInstance = Instantiate(
+            orderVisualPrefab.gameObject,
+            transform.position + Vector3.up * 4f,
+            Quaternion.identity,
+            transform
+        );
+
+        if (orderVisualInstance.TryGetComponent(out DeliveryManagerSingleUI ui))
+        {
+            ui.SetRecipeSO(orderedRecipe);
+        }
+
+        if (!orderVisualInstance.GetComponent<LookAtCamera>())
+        {
+            orderVisualInstance.AddComponent<LookAtCamera>();
         }
     }
 
     public void LeaveTable()
     {
-        if (diningTable != null)
+        SetState(CustomerState.Leaving);
+
+        // Если уходим сердитыми (или по ошибке с недоеденной едой), удаляем заказ из системы
+        if (DeliveryManager.Instance != null && orderedRecipe != null)
         {
-            diningTable.OnCustomerLeft(this);
+            DeliveryManager.Instance.RemoveOrder(orderedRecipe, diningTable);
         }
 
         if (targetChair != null)
@@ -123,20 +265,31 @@ public class CustomerAI : MonoBehaviour
             targetChair.ClearCustomer();
         }
 
-        agent.enabled = true;
-        agent.SetDestination(Vector3.zero); // Направление к выходу
-
-        Destroy(gameObject, 2f); 
-    }
-
-    public void LeaveTableAngry()
-    {
         if (diningTable != null)
         {
             diningTable.OnCustomerLeft(this);
         }
 
-        // Вычитаем золото за проваленный заказ из кошелька игрока
+        // Удаляем из глобального списка CustomerManager
+        if (CustomerManager.Instance != null)
+        {
+            CustomerManager.Instance.RemoveCustomer(this);
+        }
+
+        if (agent != null)
+        {
+            agent.enabled = true;
+            if (agent.isOnNavMesh)
+            {
+                agent.SetDestination(Vector3.zero); // Направление к выходу
+            }
+        }
+
+        Destroy(gameObject, 5f);
+    }
+
+    public void LeaveTableAngry()
+    {
         if (GameLoopManager.Instance != null)
         {
             GameLoopManager.Instance.DeductOrderGold();
@@ -144,4 +297,14 @@ public class CustomerAI : MonoBehaviour
 
         LeaveTable();
     }
+
+    private void SetState(CustomerState newState)
+    {
+        state = newState;
+        OnStateChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    public CustomerState GetState() => state;
+    public float GetPatienceNormalized() => patienceTimer / maxPatience;
+    public RecipeSO GetOrderedRecipe() => orderedRecipe;
 }

@@ -8,13 +8,12 @@ public class DeliveryManager : MonoBehaviour
     public event EventHandler OnRecipeCompleted;
     public static DeliveryManager Instance { get; private set; }
 
-    // Новая структура для связи рецепта и стола, который его ждет
     public struct Order {
         public RecipeSO recipeSO;
         public DiningTable targetTable;
     }
 
-    private List<Order> waitingOrderList; // Вместо старого waitingRecipeSOList
+    private List<Order> waitingOrderList;
 
     private void Awake()
     {
@@ -22,7 +21,6 @@ public class DeliveryManager : MonoBehaviour
         Instance = this;
     }
 
-    // Вызывается столом, когда за него садится клиент
     public void AddOrderFromTable(RecipeSO recipeSO, DiningTable diningTable)
     {
         Order newOrder = new Order {
@@ -34,7 +32,6 @@ public class DeliveryManager : MonoBehaviour
         OnRecipeSpawned?.Invoke(this, EventArgs.Empty);
     }
 
-    // Вызывается столом, если клиент ушел по таймеру (кастомная очистка)
     public void RemoveOrderFromTable(DiningTable diningTable)
     {
         for (int i = 0; i < waitingOrderList.Count; i++)
@@ -48,7 +45,19 @@ public class DeliveryManager : MonoBehaviour
         }
     }
 
-    // Попытка сдать блюдо конкретному столу
+    public void RemoveOrder(RecipeSO recipeSO, DiningTable diningTable)
+    {
+        for (int i = 0; i < waitingOrderList.Count; i++)
+        {
+            if (waitingOrderList[i].targetTable == diningTable && waitingOrderList[i].recipeSO == recipeSO)
+            {
+                waitingOrderList.RemoveAt(i);
+                OnRecipeCompleted?.Invoke(this, EventArgs.Empty);
+                break;
+            }
+        }
+    }
+
     public bool TryDeliverRecipeToTable(PlateKitchenObject plateKitchenObject, DiningTable diningTable)
     {
         for (int i = 0; i < waitingOrderList.Count; i++)
@@ -58,40 +67,50 @@ public class DeliveryManager : MonoBehaviour
             // Ищем заказ, привязанный именно к этому столу
             if (order.targetTable == diningTable)
             {
-                // Проверяем состав ингредиентов (ваша оригинальная логика совпадения)
                 bool plateContentsMatchesRecipe = true;
                 
-                foreach (KitchenObjectSO recipeKitchenObjectSO in order.recipeSO.kitchenObjectSOList)
+                if (plateKitchenObject.GetKitchenObjectSOList().Count != order.recipeSO.kitchenObjectSOList.Count)
                 {
-                    bool ingredientFound = false;
-                    foreach (KitchenObjectSO plateKitchenObjectSO in plateKitchenObject.GetKitchenObjectSOList())
+                    plateContentsMatchesRecipe = false;
+                }
+                else
+                {
+                    foreach (KitchenObjectSO recipeKitchenObjectSO in order.recipeSO.kitchenObjectSOList)
                     {
-                        if (plateKitchenObjectSO == recipeKitchenObjectSO)
+                        bool ingredientFound = false;
+                        foreach (KitchenObjectSO plateKitchenObjectSO in plateKitchenObject.GetKitchenObjectSOList())
                         {
-                            ingredientFound = true;
+                            if (plateKitchenObjectSO == recipeKitchenObjectSO)
+                            {
+                                ingredientFound = true;
+                                break;
+                            }
+                        }
+                        if (!ingredientFound)
+                        {
+                            plateContentsMatchesRecipe = false;
                             break;
                         }
-                    }
-                    if (!ingredientFound)
-                    {
-                        plateContentsMatchesRecipe = false;
-                        break;
                     }
                 }
 
                 // Если ингредиенты совпали со спецификацией заказа стола
-                if (plateContentsMatchesRecipe && plateKitchenObject.GetKitchenObjectSOList().Count == order.recipeSO.kitchenObjectSOList.Count)
+                if (plateContentsMatchesRecipe)
                 {
-                    waitingOrderList.RemoveAt(i);
-                    OnRecipeCompleted?.Invoke(this, EventArgs.Empty);
-                    return true; // Успешная доставка!
+                    // Пытаемся передать еду клиентам за этим столом
+                    if (diningTable.TryServe(order.recipeSO))
+                    {
+                        waitingOrderList.RemoveAt(i);
+                        OnRecipeCompleted?.Invoke(this, EventArgs.Empty);
+                        plateKitchenObject.DestroySelf(); // Уничтожаем тарелку с едой из рук игрока
+                        return true; 
+                    }
                 }
             }
         }
-        return false; // Не совпало
+        return false; 
     }
 
-    // Метод для UI элементов, чтобы они могли читать текущие заказы
     public List<RecipeSO> GetWaitingRecipeSOList()
     {
         List<RecipeSO> recipeSOList = new List<RecipeSO>();
