@@ -100,11 +100,16 @@ public class DeliveryManager : MonoBehaviour
                     // Пытаемся передать еду клиентам за этим столом
                     if (diningTable.TryServe(order.recipeSO))
                     {
-                        waitingOrderList.RemoveAt(i);
-                        OnRecipeCompleted?.Invoke(this, EventArgs.Empty);
-                        plateKitchenObject.DestroySelf(); // Уничтожаем тарелку с едой из рук игрока
-                        return true; 
-                    }
+                    waitingOrderList.RemoveAt(i);
+
+                     MoneyManager.Instance.AddMoney(order.recipeSO.Cost);
+
+                    OnRecipeCompleted?.Invoke(this, EventArgs.Empty);
+
+                     plateKitchenObject.DestroySelf();
+
+                        return true;
+                        }
                 }
             }
         }
