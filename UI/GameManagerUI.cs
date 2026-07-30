@@ -36,6 +36,9 @@ public class GameUIManager : MonoBehaviour
     [SerializeField] private TextMeshProUGUI successfulDeliveriesText;
     [SerializeField] private TextMeshProUGUI failedDeliveriesText;
 
+    [Header("Элементы панели поражения (Game Over)")]
+    [SerializeField] private TextMeshProUGUI gameOverReasonText;
+
     private int lastDisplayedCountdownValue = -1;
     private Coroutine countdownPunchCoroutine;
 
@@ -180,6 +183,7 @@ public class GameUIManager : MonoBehaviour
         else if (GameLoopManager.Instance.IsGameOver())
         {
             gameOverPanel.SetActive(true);
+            PopulateGameOverUI();
         }
     }
 
@@ -237,5 +241,14 @@ public class GameUIManager : MonoBehaviour
 
         if (failedDeliveriesText != null)
             failedDeliveriesText.text = "Упущено заказов: " + GameLoopManager.Instance.GetFailedDeliveriesToday().ToString();
+    }
+
+    private void PopulateGameOverUI()
+    {
+        if (GameLoopManager.Instance == null || gameOverReasonText == null) return;
+
+        gameOverReasonText.text = "День " + GameLoopManager.Instance.GetCurrentDay() +
+            ": слишком много недовольных клиентов (" +
+            GameLoopManager.Instance.GetFailedDeliveriesToday() + ")";
     }
 }

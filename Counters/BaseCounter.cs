@@ -18,6 +18,17 @@ public class BaseCounter : MonoBehaviour, IKitchenObjectParent
         }
     }
 
+    protected virtual void OnDestroy()
+    {
+        // Освобождаем ячейку сетки, если счётчик когда-либо будет уничтожен в рантайме
+        // (например, продажа/снос мебели в фазе подготовки). Без этого ячейка навсегда
+        // остаётся "занятой" в GridPositioningSystem даже после Destroy(gameObject).
+        if (GridPositioningSystem.Instance != null)
+        {
+            GridPositioningSystem.Instance.RemoveCounter(this);
+        }
+    }
+
     public virtual void InteractAlternate(Player player)
     {
 

@@ -33,8 +33,11 @@ public class GameLoopManager : MonoBehaviour
     private int currentDay = 1;
 
     [Header("Экономика и Очки")]
-    [SerializeField] private int baseRewardPerOrder = 50; // Базовая оплата за успешное блюдо
     [SerializeField] private int basePenaltyPerOrder = 20; // Штраф за проваленный заказ
+
+    [Header("Условие поражения")]
+    [Tooltip("Если за одну смену уходит недовольными больше этого числа клиентов — игра окончена")]
+    [SerializeField] private int maxAngryCustomersPerDay = 5;
     
     private int totalGold = 0; // Накопленное золото (всего у игрока)
     private int goldEarnedToday = 0; // Заработано золота за сегодня
@@ -185,22 +188,26 @@ public class GameLoopManager : MonoBehaviour
 
     /// <summary>
     /// Метод начисления золота за успешно выполненный заказ.
+    /// amount — стоимость конкретного рецепта (RecipeSO.Cost), а не фиксированная награда,
+    /// чтобы дорогие блюда были выгоднее дешёвых.
     /// </summary>
-    public void AddOrderGold()
+    public void AddOrderGold(int amount)
     {
         if (!IsGamePlaying()) return;
 
-        goldEarnedToday += baseRewardPerOrder;
+        goldEarnedToday += amount;
         successfulDeliveriesToday++;
         
         OnGoldChanged?.Invoke(this, new OnGoldChangedEventArgs { 
             currentTotalGold = totalGold + (goldEarnedToday - goldLostToday), 
-            changeAmount = baseRewardPerOrder 
+            changeAmount = amount 
         });
     }
 
     /// <summary>
     /// Начисление штрафа при уходе недовольного клиента или просрочке заказа.
+    /// Если недовольных за смену набирается больше maxAngryCustomersPerDay — смена
+    /// обрывается немедленно поражением, не дожидаясь конца таймера.
     /// </summary>
     public void DeductOrderGold()
     {
@@ -213,7 +220,46 @@ public class GameLoopManager : MonoBehaviour
             currentTotalGold = Mathf.Max(0, totalGold + (goldEarnedToday - goldLostToday)), 
             changeAmount = -basePenaltyPerOrder 
         });
+
+        if (failedDeliveriesToday >= maxAngryCustomersPerDay)
+        {
+            TriggerGameOver();
+        }
     }
+
+    /// <summary>
+    /// Немедленный переход в состояние поражения — смена прерывается на месте,
+    /// таймер и спавн клиентов останавливаются сами (Update/CustomerManager смотрят на state).
+    /// </summary>
+    private void TriggerGameOver()
+    {
+        state = State.GameOver;
+        OnStateChanged?.Invoke(this, EventArgs.Empty);
+
+        Debug.Log($"[GameLoop] День {currentDay}: недовольных клиентов за смену — {failedDeliveriesToday}. Игра окончена.");
+    }
+
+    /// <summary>
+    /// Списывает деньги с накопленного баланса (totalGold) — например, при покупке нового
+    /// стола/оборудования в фазе подготовки. Возвращает false, если денег не хватает.
+    /// Работает с totalGold, а не с дневной статистикой, т.к. тратить предполагается
+    /// между днями, когда goldEarnedToday/goldLostToday уже обнулены.
+    /// </summary>
+    public bool SpendMoney(int amount)
+    {
+        if (totalGold < amount) return false;
+
+        totalGold -= amount;
+
+        OnGoldChanged?.Invoke(this, new OnGoldChangedEventArgs {
+            currentTotalGold = totalGold + (goldEarnedToday - goldLostToday),
+            changeAmount = -amount
+        });
+
+        return true;
+    }
+
+    public bool HasEnoughMoney(int amount) => totalGold >= amount;
 
     // Вспомогательные методы проверки текущих состояний игры
     public bool IsPreparationActive() => state == State.DayPreparation;

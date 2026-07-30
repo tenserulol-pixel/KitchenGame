@@ -102,7 +102,10 @@ public class DeliveryManager : MonoBehaviour
                     {
                     waitingOrderList.RemoveAt(i);
 
-                     MoneyManager.Instance.AddMoney(order.recipeSO.Cost);
+                    if (GameLoopManager.Instance != null)
+                    {
+                        GameLoopManager.Instance.AddOrderGold(order.recipeSO.Cost);
+                    }
 
                     OnRecipeCompleted?.Invoke(this, EventArgs.Empty);
 

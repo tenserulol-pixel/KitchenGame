@@ -7,23 +7,29 @@ public class MoneyUI : MonoBehaviour
 
     private void Start()
     {
-        UpdateVisual();
+        UpdateVisual(GameLoopManager.Instance != null ? GameLoopManager.Instance.GetTotalGold() : 0);
 
-        MoneyManager.Instance.OnMoneyChanged += MoneyChanged;
+        if (GameLoopManager.Instance != null)
+        {
+            GameLoopManager.Instance.OnGoldChanged += GameLoopManager_OnGoldChanged;
+        }
     }
 
     private void OnDestroy()
     {
-        MoneyManager.Instance.OnMoneyChanged -= MoneyChanged;
+        if (GameLoopManager.Instance != null)
+        {
+            GameLoopManager.Instance.OnGoldChanged -= GameLoopManager_OnGoldChanged;
+        }
     }
 
-    private void MoneyChanged(object sender, System.EventArgs e)
+    private void GameLoopManager_OnGoldChanged(object sender, GameLoopManager.OnGoldChangedEventArgs e)
     {
-        UpdateVisual();
+        UpdateVisual(e.currentTotalGold);
     }
 
-    private void UpdateVisual()
+    private void UpdateVisual(int amount)
     {
-        moneyText.text = "" + MoneyManager.Instance.GetMoney();
+        moneyText.text = "" + amount;
     }
 }

@@ -81,11 +81,11 @@ public class Player : MonoBehaviour, IKitchenObjectParent
             {
                 cuttingCounter.SetCuttingState(isHeld);
             }
-            // Для раковины (если добавите метод SetWashingState)
-            // else if (selectedCounter is SinkCounter sinkCounter)
-            // {
-            //     sinkCounter.SetWashingState(isHeld);
-            // }
+            // Для раковины
+            else if (selectedCounter is SinkCounter sinkCounter)
+            {
+                sinkCounter.SetWashingState(isHeld);
+            }
             // Для других столов, поддерживающих удержание, добавляйте аналогично
         }
     }
@@ -236,6 +236,8 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     }
 
     public bool IsWalking() => isWalking;
+
+    public BaseCounter GetSelectedCounter() => selectedCounter;
 
     // === РЕАЛИЗАЦИЯ ИНТЕРФЕЙСА IKITCHENOBJECTPARENT (Для переноски предметов) ===
 

@@ -213,12 +213,9 @@ public class DiningTable : BaseCounter
                     {
                         if (DeliveryManager.Instance.TryDeliverRecipeToTable(plateKitchenObject, this))
                         {
+                            // Золото начисляется внутри DeliveryManager.TryDeliverRecipeToTable —
+                            // там же, где известна реальная стоимость рецепта (recipeSO.Cost).
                             Debug.Log("Заказ успешно передан клиенту за столом!");
-                            // За успешную выдачу начисляем золото
-                            if (GameLoopManager.Instance != null)
-                            {
-                                GameLoopManager.Instance.AddOrderGold();
-                            }
                         }
                         else
                         {

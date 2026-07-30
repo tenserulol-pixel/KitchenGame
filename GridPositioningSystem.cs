@@ -89,11 +89,16 @@ public class GridPositioningSystem : MonoBehaviour
     {
         Vector2Int gridPos = GetGridPosition(targetWorldPosition);
 
-        if (IsCellOccupied(gridPos))
+        if (IsCellOccupied(gridPos) && occupiedCells[gridPos] != counter)
         {
             Debug.LogWarning($"[GridSystem] Не удалось разместить! Ячейка {gridPos} уже занята объектом: {occupiedCells[gridPos].gameObject.name}");
             return false;
         }
+
+        // Если этот же счётчик уже числится в какой-то другой ячейке — например, Awake()
+        // уже успел зарегистрировать его по позиции спавна до того, как вызвали этот метод —
+        // освобождаем старую ячейку, иначе она навсегда останется фантомно "занятой".
+        RemoveCounter(counter);
 
         // Выравниваем объект по центру сетки
         Vector3 alignedPosition = GetWorldPosition(gridPos);
@@ -106,6 +111,16 @@ public class GridPositioningSystem : MonoBehaviour
         occupiedCells[gridPos] = counter;
         Debug.Log($"[GridSystem] Объект {counter.gameObject.name} успешно размещен в ячейке {gridPos}");
         return true;
+    }
+
+    /// <summary>
+    /// Проверяет, свободна ли ячейка проверки — свободна ли она вообще, либо занята
+    /// тем же самым counter'ом (актуально при переносе мебели: собственная текущая
+    /// ячейка объекта не должна считаться "занятой" для него самого).
+    /// </summary>
+    public bool IsCellFreeFor(Vector2Int gridPosition, BaseCounter counter)
+    {
+        return !occupiedCells.ContainsKey(gridPosition) || occupiedCells[gridPosition] == counter;
     }
 
     /// <summary>
