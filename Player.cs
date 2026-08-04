@@ -25,6 +25,18 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     [SerializeField] private float playerRadius = 0.7f;
     [SerializeField] private float playerHeight = 2f;
 
+    [Header("Притяжение к выбранной станции")]
+    [Tooltip("На каком расстоянии от станции игрок 'встаёт' при взаимодействии")]
+    [SerializeField] private float snapStandDistance = 1.2f;
+    [Tooltip("Скорость притягивания позиции к точке у станции")]
+    [SerializeField] private float snapMoveSpeed = 4f;
+    [Tooltip("Скорость довора лицом к станции")]
+    [SerializeField] private float snapRotateSpeed = 8f;
+
+    [Header("Буфер взаимодействия")]
+    [Tooltip("Сколько секунд после нажатия кнопка 'ждёт' появления валидной станции")]
+    [SerializeField] private float interactBufferDuration = 0.2f;
+
     [Header("Точка удержания предметов")]
     [SerializeField] private Transform kitchenObjectHoldPoint;
 
@@ -32,6 +44,11 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     private Vector3 lastInteractDir;
     private BaseCounter selectedCounter;
     private KitchenObject kitchenObject;
+
+    // -1 значит "буфер неактивен"; иначе — момент времени (Time.time), до которого
+    // ожидающее нажатие ещё считается актуальным
+    private float interactBufferExpireTime = -1f;
+    private float interactAlternateBufferExpireTime = -1f;
 
     private void Awake()
     {
@@ -70,6 +87,8 @@ public class Player : MonoBehaviour, IKitchenObjectParent
 
         HandleMovement();
         HandleInteractions();
+        HandleCounterSnap();
+        HandleBufferedInteractions();
 
         // ---------- Передача состояния удержания для длительных действий ----------
         if (selectedCounter != null)
@@ -194,6 +213,108 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     }
 
     /// <summary>
+    /// Плавно притягивает игрока к удобной точке перед выбранной станцией и доворачивает
+    /// его лицом к ней. Точка считается от РЕАЛЬНОЙ поверхности коллайдера станции
+    /// (Collider.ClosestPoint), а не от фиксированного расстояния до её pivot — иначе
+    /// для больших объектов вроде стола фиксированная дистанция могла оказаться внутри
+    /// самого объекта, и притяжение утаскивало игрока прямо в него (или сквозь него).
+    /// snapStandDistance теперь — это запас ПОВЕРХ фактического края объекта, а не
+    /// расстояние от центра, так что одно и то же значение корректно работает и для
+    /// маленького прилавка, и для стола.
+    /// Пока игрок несёт мебель через FurnitureMovingController, притяжение отключается,
+    /// иначе оно будет мешать свободно ходить со станцией в руках.
+    /// </summary>
+    private void HandleCounterSnap()
+    {
+        if (selectedCounter == null) return;
+
+        if (FurnitureMovingController.Instance != null && FurnitureMovingController.Instance.IsCarryingFurniture)
+        {
+            return;
+        }
+
+        Vector3 counterCenter = selectedCounter.transform.position;
+        Collider counterCollider = selectedCounter.GetComponent<Collider>();
+
+        Vector3 idealPosition;
+
+        if (counterCollider != null)
+        {
+            Vector3 surfacePoint = counterCollider.ClosestPoint(transform.position);
+            Vector3 outward = transform.position - surfacePoint;
+            outward.y = 0f;
+
+            if (outward.sqrMagnitude < 0.0001f)
+            {
+                // Игрок уже на поверхности/внутри коллайдера — направление "наружу" через
+                // ближайшую точку не определить, отталкиваемся от центра станции вместо этого.
+                outward = transform.position - counterCenter;
+                outward.y = 0f;
+                if (outward.sqrMagnitude < 0.0001f) return;
+            }
+
+            outward.Normalize();
+            idealPosition = surfacePoint + outward * (playerRadius + snapStandDistance);
+        }
+        else
+        {
+            // На счётчике почему-то нет коллайдера — старое поведение как запасной вариант.
+            Vector3 towardPlayer = transform.position - counterCenter;
+            towardPlayer.y = 0f;
+            if (towardPlayer.sqrMagnitude < 0.0001f) return;
+            towardPlayer.Normalize();
+            idealPosition = counterCenter + towardPlayer * snapStandDistance;
+        }
+
+        idealPosition.y = transform.position.y; // высоту не трогаем
+
+        transform.position = Vector3.MoveTowards(transform.position, idealPosition, snapMoveSpeed * Time.deltaTime);
+
+        Vector3 lookDir = counterCenter - transform.position;
+        lookDir.y = 0f;
+        if (lookDir.sqrMagnitude > 0.0001f)
+        {
+            Quaternion idealRotation = Quaternion.LookRotation(lookDir.normalized);
+            transform.rotation = Quaternion.Slerp(transform.rotation, idealRotation, snapRotateSpeed * Time.deltaTime);
+        }
+    }
+
+    /// <summary>
+    /// Проверяет отложенные (буферизованные) нажатия E/F — если игрок нажал кнопку
+    /// чуть раньше, чем selectedCounter успел обновиться (например, ещё доворачивается
+    /// через автопритяжение), нажатие не теряется, а срабатывает, как только появится
+    /// валидная станция — в пределах interactBufferDuration после нажатия.
+    /// </summary>
+    private void HandleBufferedInteractions()
+    {
+        if (interactBufferExpireTime > 0f)
+        {
+            if (selectedCounter != null)
+            {
+                selectedCounter.Interact(this);
+                interactBufferExpireTime = -1f;
+            }
+            else if (Time.time > interactBufferExpireTime)
+            {
+                interactBufferExpireTime = -1f; // окно истекло, станция так и не появилась
+            }
+        }
+
+        if (interactAlternateBufferExpireTime > 0f)
+        {
+            if (selectedCounter != null)
+            {
+                selectedCounter.InteractAlternate(this);
+                interactAlternateBufferExpireTime = -1f;
+            }
+            else if (Time.time > interactAlternateBufferExpireTime)
+            {
+                interactAlternateBufferExpireTime = -1f;
+            }
+        }
+    }
+
+    /// <summary>
     /// Обычное взаимодействие (Клавиша E).
     /// </summary>
     private void GameInput_OnInteractAction(object sender, EventArgs e)
@@ -205,6 +326,13 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         if (selectedCounter != null)
         {
             selectedCounter.Interact(this);
+        }
+        else
+        {
+            // Станция ещё не выбрана прямо сейчас — запоминаем нажатие на короткое время,
+            // а не теряем его. HandleBufferedInteractions() досрочно выполнит его, как
+            // только (и если) выбор станции довалидируется в пределах этого окна.
+            interactBufferExpireTime = Time.time + interactBufferDuration;
         }
     }
 
@@ -223,6 +351,10 @@ public class Player : MonoBehaviour, IKitchenObjectParent
 
             // ВАЖНО: состояние удержания теперь передаётся в Update() каждый кадр,
             // поэтому здесь НЕ вызываем SetCuttingState или SetWashingState.
+        }
+        else
+        {
+            interactAlternateBufferExpireTime = Time.time + interactBufferDuration;
         }
     }
 

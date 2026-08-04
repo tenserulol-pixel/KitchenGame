@@ -17,6 +17,9 @@ public class DiningTable : BaseCounter
     [Header("Настройки стульев")]
     [SerializeField] private Chair[] chairs;
 
+    // Стулья, убранные через RemoveNearestChair — ждут возврата через ReturnStoredChair
+    private readonly List<Chair> storedChairs = new List<Chair>();
+
     [Header("Настройки Грязной Посуды")]
     [SerializeField] private KitchenObjectSO dirtyPlateKitchenObjectSO; // Ссылка на Scriptable Object грязной тарелки
     [SerializeField] private Transform dirtyPlateVisualPrefab; // Префаб визуальной модели тарелки для стопки
@@ -33,9 +36,31 @@ public class DiningTable : BaseCounter
     private int finishedEatingCountCached = 0; // Сколько гостей реально поели (для точного количества посуды)
     private int dirtyPlatesCount = 0; // Сколько грязных тарелок сейчас физически находится на столе
 
-    private void Awake()
+    protected override void Awake()
     {
+        // ВАЖНО: раньше здесь был "private void Awake()" без base.Awake() —
+        // это молча скрывало Awake() из BaseCounter (Unity вызывает только его),
+        // и обеденные столы вообще не регистрировались в GridPositioningSystem.
+        base.Awake();
+
         tableState = TableState.Free;
+
+        // Делаем стулья дочерними объектами стола programmatically — тогда при переносе
+        // стола (FurnitureMovingController или вообще любое изменение transform.position)
+        // они едут вместе с ним автоматически через обычную иерархию Unity, независимо
+        // от того, как стулья были расставлены в сцене изначально. worldPositionStays: true
+        // сохраняет их текущее место в мире — при запуске сцены ничего визуально не дёрнется,
+        // просто у объекта поменяется родитель в иерархии.
+        if (chairs != null)
+        {
+            foreach (Chair chair in chairs)
+            {
+                if (chair != null)
+                {
+                    chair.transform.SetParent(transform, true);
+                }
+            }
+        }
     }
 
     public bool HasFreeChair()
@@ -300,4 +325,73 @@ public class DiningTable : BaseCounter
     public int GetCustomerCount() => currentCustomers.Count;
     public List<CustomerAI> GetCustomers() => currentCustomers;
     public Chair[] GetChairs() => chairs;
+
+    /// <summary>
+    /// Убирает стул, ближайший к указанной мировой позиции (обычно — позиция игрока),
+    /// и откладывает его (а не уничтожает) — чтобы позже можно было вернуть тем же
+    /// стулом через ReturnStoredChair(). Массив chairs пересобирается без него, а не
+    /// просто зануляется — HasFreeChair()/GetFreeChair() выше по файлу не проверяют
+    /// chairs на null, так что оставлять "дыры" в массиве было бы риском вылета в рантайме.
+    /// </summary>
+    public void RemoveNearestChair(Vector3 fromPosition)
+    {
+        if (chairs == null || chairs.Length == 0) return;
+
+        Chair nearest = null;
+        float nearestDistance = float.MaxValue;
+
+        foreach (Chair chair in chairs)
+        {
+            if (chair == null || chair.IsOccupied()) continue;
+
+            float distance = Vector3.Distance(chair.transform.position, fromPosition);
+            if (distance < nearestDistance)
+            {
+                nearestDistance = distance;
+                nearest = chair;
+            }
+        }
+
+        if (nearest == null) return;
+
+        List<Chair> remaining = new List<Chair>(chairs);
+        remaining.Remove(nearest);
+        chairs = remaining.ToArray();
+
+        // Стул остаётся дочерним объектом стола (просто неактивным), поэтому его позиция
+        // относительно стола не теряется — даже если стол потом передвинут, стул при
+        // возврате появится там же, где и должен, без отдельного хранения координат.
+        nearest.gameObject.SetActive(false);
+        storedChairs.Add(nearest);
+
+        Debug.Log($"[DiningTable] '{name}': стул убран (можно вернуть), осталось мест — {chairs.Length}.");
+    }
+
+    /// <summary>
+    /// Возвращает последний убранный стул (LIFO — "отменить последнее убирание").
+    /// Стул всё это время оставался дочерним объектом стола, просто неактивным,
+    /// поэтому позиция относительно стола не потерялась, даже если стол успели
+    /// передвинуть через FurnitureMovingController.
+    /// </summary>
+    public void ReturnStoredChair()
+    {
+        if (storedChairs.Count == 0)
+        {
+            Debug.Log($"[DiningTable] '{name}': нет убранных стульев, нечего возвращать.");
+            return;
+        }
+
+        Chair returning = storedChairs[storedChairs.Count - 1];
+        storedChairs.RemoveAt(storedChairs.Count - 1);
+
+        returning.gameObject.SetActive(true);
+
+        List<Chair> updated = new List<Chair>(chairs);
+        updated.Add(returning);
+        chairs = updated.ToArray();
+
+        Debug.Log($"[DiningTable] '{name}': стул возвращён, мест теперь — {chairs.Length}.");
+    }
+
+    public int GetStoredChairCount() => storedChairs.Count;
 }
