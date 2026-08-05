@@ -27,10 +27,21 @@ public class CustomerManager : MonoBehaviour
     [SerializeField] private int daysPerGroupSizeIncrease = 3;
     [SerializeField] private int maxGroupSizeCap = 6;
 
+    [Header("Дневная норма (вместо таймера)")]
+    [Tooltip("Сколько групп клиентов приходит за первый день")]
+    [SerializeField] private int dailyGroupTarget = 5;
+    [Tooltip("На сколько групп растёт дневная норма за каждый пройденный день")]
+    [SerializeField] private int dailyGroupTargetIncreasePerDay = 1;
+    [SerializeField] private int dailyGroupTargetCap = 15;
+
     // Значения из инспектора трактуются как "баланс на 1-й день" — от них и масштабируем
     private float baseSpawnInterval;
     private int baseMaxCustomers;
     private int baseMaxGroupSize;
+    private int baseDailyGroupTarget;
+
+    // Сколько групп уже заспавнено сегодня — сбрасывается на каждый новый день
+    private int groupsSpawnedToday = 0;
 
     // Столы больше не назначаются вручную в инспекторе: список заполняется автоматически
     // в Awake() через FindObjectsOfType, чтобы новый стол на сцене не забыли сюда добавить.
@@ -52,6 +63,7 @@ public class CustomerManager : MonoBehaviour
         baseSpawnInterval = spawnInterval;
         baseMaxCustomers = maxCustomers;
         baseMaxGroupSize = maxGroupSize;
+        baseDailyGroupTarget = dailyGroupTarget;
 
         allTables = new List<DiningTable>(FindObjectsOfType<DiningTable>());
     }
@@ -80,6 +92,7 @@ public class CustomerManager : MonoBehaviour
     /// <summary>
     /// Пересчитывает параметры спавна на основе номера текущего дня.
     /// Значения из инспектора = баланс 1-го дня, дальше — постепенно сложнее, с ограничениями сверху/снизу.
+    /// Здесь же сбрасывается groupsSpawnedToday — раз в день, в момент начала подготовки к нему.
     /// </summary>
     private void ApplyDayDifficulty(int day)
     {
@@ -91,8 +104,12 @@ public class CustomerManager : MonoBehaviour
         int groupSizeIncrease = daysPerGroupSizeIncrease > 0 ? daysPassed / daysPerGroupSizeIncrease : 0;
         maxGroupSize = Mathf.Min(maxGroupSizeCap, baseMaxGroupSize + groupSizeIncrease);
 
+        dailyGroupTarget = Mathf.Min(dailyGroupTargetCap, baseDailyGroupTarget + dailyGroupTargetIncreasePerDay * daysPassed);
+        groupsSpawnedToday = 0;
+
         Debug.Log($"[CustomerManager] День {day}: интервал спавна {spawnInterval:F1}с, " +
-                  $"макс. клиентов {maxCustomers}, макс. размер группы {maxGroupSize}.");
+                  $"макс. клиентов {maxCustomers}, макс. размер группы {maxGroupSize}, " +
+                  $"норма групп на день {dailyGroupTarget}.");
     }
 
     private void Update()
@@ -114,6 +131,13 @@ public class CustomerManager : MonoBehaviour
 
     private void TrySpawnCustomerGroup()
     {
+        // Сегодняшняя норма уже выполнена — новых групп больше не будет, день
+        // завершится сам, как только последние клиенты разойдутся (см. IsDailyWorkloadComplete).
+        if (groupsSpawnedToday >= dailyGroupTarget)
+        {
+            return;
+        }
+
         int groupSize = UnityEngine.Random.Range(minGroupSize, maxGroupSize + 1);
 
         // Не превышаем лимит клиентов
@@ -153,8 +177,9 @@ public class CustomerManager : MonoBehaviour
         }
 
         table.OccupyTable(group);
+        groupsSpawnedToday++;
 
-        Debug.Log($"Создана группа из {groupSize} человек.");
+        Debug.Log($"Создана группа из {groupSize} человек. Групп сегодня: {groupsSpawnedToday}/{dailyGroupTarget}.");
     }
 
     private DiningTable FindAvailableTable(int groupSize)
@@ -182,4 +207,15 @@ public class CustomerManager : MonoBehaviour
     public bool HasFreeTable(int groupSize) => FindAvailableTable(groupSize) != null;
 
     public List<CustomerAI> GetCustomers() => customerList;
+
+    /// <summary>
+    /// День выполнен, когда сегодняшняя норма групп заспавнена И в зале никого не осталось
+    /// (все либо обслужены и ушли, либо ушли недовольными). Используется GameLoopManager'ом
+    /// вместо таймера для завершения GamePlaying.
+    /// </summary>
+    public bool IsDailyWorkloadComplete() => groupsSpawnedToday >= dailyGroupTarget && customerList.Count == 0;
+
+    public int GetGroupsSpawnedToday() => groupsSpawnedToday;
+    public int GetDailyGroupTarget() => dailyGroupTarget;
+    public float GetDailyProgressNormalized() => dailyGroupTarget > 0 ? (float)groupsSpawnedToday / dailyGroupTarget : 1f;
 }

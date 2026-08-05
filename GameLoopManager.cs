@@ -23,11 +23,9 @@ public class GameLoopManager : MonoBehaviour
 
     [Header("Тайминги игры")]
     [SerializeField] private float countdownToStartTimerMax = 3f; // Время обратного отсчета
-    [SerializeField] private float gamePlayingTimerMax = 120f;    // Длительность рабочего дня (в секундах)
 
     private State state;
     private float countdownToStartTimer;
-    private float gamePlayingTimer;
     
     [Header("Цикл Дней и Прогрессия")]
     private int currentDay = 1;
@@ -98,9 +96,9 @@ public class GameLoopManager : MonoBehaviour
                 break;
 
             case State.GamePlaying:
-                gamePlayingTimer -= Time.deltaTime;
-
-                if (gamePlayingTimer <= 0f)
+                // День больше не идёт по таймеру — заканчивается, когда сегодняшняя
+                // норма групп заспавнена и зал полностью опустел (см. CustomerManager).
+                if (CustomerManager.Instance != null && CustomerManager.Instance.IsDailyWorkloadComplete())
                 {
                     FinishActiveDay();
                 }
@@ -178,7 +176,6 @@ public class GameLoopManager : MonoBehaviour
     private void ResetDayStats()
     {
         countdownToStartTimer = countdownToStartTimerMax;
-        gamePlayingTimer = gamePlayingTimerMax;
 
         goldEarnedToday = 0;
         goldLostToday = 0;
@@ -271,8 +268,6 @@ public class GameLoopManager : MonoBehaviour
     // Геттеры для UI
     public int GetCurrentDay() => currentDay;
     public float GetCountdownToStartTimer() => countdownToStartTimer;
-    public float GetGamePlayingTimerNormalized() => gamePlayingTimer / gamePlayingTimerMax;
-    public float GetGamePlayingTimer() => gamePlayingTimer;
 
     // Финансовые геттеры для экрана результатов дня
     public int GetTotalGold() => totalGold;

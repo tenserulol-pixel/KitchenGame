@@ -25,7 +25,8 @@ public class GameUIManager : MonoBehaviour
     [Header("Элементы игровой панели (Gameplay)")]
     [SerializeField] private TextMeshProUGUI dayText;
     [SerializeField] private TextMeshProUGUI goldText;
-    [SerializeField] private Image timerBarImage; // Слайдер времени раунда (Type: Filled)
+    [SerializeField] private Image timerBarImage; // Индикатор дневной нормы (Type: Filled)
+    [SerializeField] private TextMeshProUGUI dailyProgressText; // Необязательно: "3 / 6" рядом с индикатором
 
     [Header("Элементы панели результатов (Results)")]
     [SerializeField] private TextMeshProUGUI resultsDayTitleText;
@@ -85,12 +86,18 @@ public class GameUIManager : MonoBehaviour
             }
         }
 
-        // 2. Плавная работа кругового индикатора/шкалы времени раунда
+        // 2. Плавная работа индикатора дневной нормы (раньше — таймер, теперь прогресс по группам)
         if (GameLoopManager.Instance != null && GameLoopManager.Instance.IsGamePlaying())
         {
-            if (timerBarImage != null)
+            if (timerBarImage != null && CustomerManager.Instance != null)
             {
-                timerBarImage.fillAmount = GameLoopManager.Instance.GetGamePlayingTimerNormalized();
+                timerBarImage.fillAmount = CustomerManager.Instance.GetDailyProgressNormalized();
+            }
+
+            if (dailyProgressText != null && CustomerManager.Instance != null)
+            {
+                dailyProgressText.text = CustomerManager.Instance.GetGroupsSpawnedToday() +
+                    " / " + CustomerManager.Instance.GetDailyGroupTarget();
             }
         }
     }
