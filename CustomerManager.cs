@@ -217,5 +217,11 @@ public class CustomerManager : MonoBehaviour
 
     public int GetGroupsSpawnedToday() => groupsSpawnedToday;
     public int GetDailyGroupTarget() => dailyGroupTarget;
+
+    // Для карты "Щедрый день" — снижает, насколько быстро растёт дневная норма групп
+    // по дням, не ниже нуля (отрицательный прирост означал бы, что норма со временем
+    // сама уменьшается, что не было целью карты).
+    public void ReduceDailyGroupTargetGrowth(int amount) =>
+        dailyGroupTargetIncreasePerDay = Mathf.Max(0, dailyGroupTargetIncreasePerDay - amount);
     public float GetDailyProgressNormalized() => dailyGroupTarget > 0 ? (float)groupsSpawnedToday / dailyGroupTarget : 1f;
 }

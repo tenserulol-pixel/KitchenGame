@@ -137,6 +137,35 @@ public class UpgradeManager : MonoBehaviour
                 if (GameLoopManager.Instance != null)
                     GameLoopManager.Instance.IncreaseAngryCustomerTolerance(Mathf.RoundToInt(card.value));
                 break;
+
+            case UpgradeEffectType.UnstableMagic:
+                if (Player.Instance != null)
+                {
+                    Player.Instance.IncreaseCuttingSpeedMultiplier(card.value);
+                    Player.Instance.IncreaseCuttingRuinChance(card.secondaryValue);
+                }
+                break;
+
+            case UpgradeEffectType.PenaltyReduction:
+                if (GameLoopManager.Instance != null)
+                    GameLoopManager.Instance.ReducePenaltyPerOrder(Mathf.RoundToInt(card.value));
+                break;
+
+            case UpgradeEffectType.BonusGold:
+                if (GameLoopManager.Instance != null)
+                    GameLoopManager.Instance.AddBonusGold(Mathf.RoundToInt(card.value));
+                break;
+
+            case UpgradeEffectType.SlowerQuotaGrowth:
+                if (CustomerManager.Instance != null)
+                    CustomerManager.Instance.ReduceDailyGroupTargetGrowth(Mathf.RoundToInt(card.value));
+                break;
+
+            case UpgradeEffectType.DarkDeal:
+                if (Player.Instance != null) Player.Instance.IncreaseRecipeCostMultiplier(card.value);
+                if (GameLoopManager.Instance != null)
+                    GameLoopManager.Instance.IncreaseAngryCustomerTolerance(Mathf.RoundToInt(card.secondaryValue));
+                break;
         }
     }
 

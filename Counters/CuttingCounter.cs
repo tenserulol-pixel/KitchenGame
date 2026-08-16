@@ -9,7 +9,11 @@ public class CuttingCounter : BaseCounter, IHasProgress
     public event EventHandler OnCut; 
 
     [SerializeField] private CuttingRecipeSO[] cuttingRecipeSOarray; 
-    
+
+    [Header("Нестабильная магия (лужа на полу)")]
+    [Tooltip("Префаб лужи — спавнится в свободной соседней ячейке при провале резки")]
+    [SerializeField] private GameObject puddlePrefab;
+
     private float cuttingProgress; // Используем float для плавного удержания
     private bool isPlayerCutting = false;
 
@@ -23,8 +27,10 @@ public class CuttingCounter : BaseCounter, IHasProgress
             {
                 CuttingRecipeSO cuttingRecipeSO = GetCuttingRecipeSOWithInput(GetKitchenObject().GetKitchenObjectSo());
                 
-                // Плавно увеличиваем прогресс
-                cuttingProgress += Time.deltaTime;
+                // Плавно увеличиваем прогресс — множитель от карт вроде "Нестабильная магия",
+                // по умолчанию 1 (без Player или без карт — обычная скорость, ничего не меняется)
+                float speedMultiplier = Player.Instance != null ? Player.Instance.GetCuttingSpeedMultiplier() : 1f;
+                cuttingProgress += Time.deltaTime * speedMultiplier;
 
                 // Отправляем текущий прогресс в полоску UI
                 OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs
@@ -35,16 +41,34 @@ public class CuttingCounter : BaseCounter, IHasProgress
                 // Если время удержания закончилось — объект нарезался!
                 if (cuttingProgress >= cuttingRecipeSO.cuttingProgressMax)
                 {
-                    KitchenObjectSO outputKitchenObjectSO = GetOutputForInput(GetKitchenObject().GetKitchenObjectSo());
-                    
-                    GetKitchenObject().DestroySelf();
-                    KitchenObject.SpawnKitchenObject(outputKitchenObjectSO, this);   
-                    
-                    // КРИТИЧЕСКИЙ МОМЕНТ: Сбрасываем резку и обнуляем прогресс
+                    // КРИТИЧЕСКИЙ МОМЕНТ: Сбрасываем резку и обнуляем прогресс — до любого из
+                    // двух исходов ниже, обоим он одинаково нужен.
                     isPlayerCutting = false;
                     cuttingProgress = 0f;
 
-                    // Принудительно отправляем 0f (или 1f), чтобы ProgressBarUI вызвал свой метод Hide()
+                    float ruinChance = Player.Instance != null
+                        ? Mathf.Clamp01(Player.Instance.GetCuttingRuinChance())
+                        : 0f;
+
+                    if (ruinChance > 0f && UnityEngine.Random.value < ruinChance)
+                    {
+                        // Магия подвела — ингредиент теряется, а рядом на полу появляется
+                        // физическая лужа (см. TrySpawnPuddle) — сама станция резки при этом
+                        // остаётся доступной сразу же, помеха теперь отдельно на полу.
+                        GetKitchenObject().DestroySelf();
+                        TrySpawnPuddle();
+
+                        Debug.Log($"[CuttingCounter] '{name}': магия испортила ингредиент.");
+                    }
+                    else
+                    {
+                        KitchenObjectSO outputKitchenObjectSO = GetOutputForInput(GetKitchenObject().GetKitchenObjectSo());
+
+                        GetKitchenObject().DestroySelf();
+                        KitchenObject.SpawnKitchenObject(outputKitchenObjectSO, this);
+                    }
+
+                    // Принудительно отправляем 0f, чтобы ProgressBarUI вызвал свой метод Hide()
                     OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs
                     {
                         progressNormalized = 0f
@@ -113,6 +137,32 @@ public class CuttingCounter : BaseCounter, IHasProgress
                 });
             }
         }
+    }
+
+    /// <summary>
+    /// Ищет свободную соседнюю (по сетке) ячейку и спавнит там префаб лужи. Если все четыре
+    /// соседние ячейки заняты — просто ничего не спавнит, ингредиент всё равно уже потерян.
+    /// </summary>
+    private void TrySpawnPuddle()
+    {
+        if (puddlePrefab == null || GridPositioningSystem.Instance == null) return;
+
+        Vector2Int myCell = GridPositioningSystem.Instance.GetGridPosition(transform.position);
+        Vector2Int[] neighborOffsets = { Vector2Int.up, Vector2Int.down, Vector2Int.left, Vector2Int.right };
+
+        foreach (Vector2Int offset in neighborOffsets)
+        {
+            Vector2Int candidateCell = myCell + offset;
+
+            if (!GridPositioningSystem.Instance.IsCellOccupied(candidateCell))
+            {
+                Vector3 spawnPosition = GridPositioningSystem.Instance.GetWorldPosition(candidateCell);
+                Instantiate(puddlePrefab, spawnPosition, Quaternion.identity);
+                return;
+            }
+        }
+
+        Debug.Log($"[CuttingCounter] '{name}': не нашлось свободной соседней ячейки для лужи.");
     }
 
     // Вызывается из Player.cs каждый кадр

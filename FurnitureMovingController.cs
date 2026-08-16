@@ -148,6 +148,13 @@ public class FurnitureMovingController : MonoBehaviour
             Debug.Log(
                 $"[FurnitureMoving] '{movingCounter.name}' размещён на новом месте.");
 
+            // Если переставили именно стол — проверяем физически, всем ли его стульям
+            // хватило места на новом месте (пока movingCounter ещё не обнулён FinishMoving()).
+            if (movingCounter is DiningTable table)
+            {
+                table.RemoveChairsWithoutRoom();
+            }
+
             FinishMoving();
         }
         else

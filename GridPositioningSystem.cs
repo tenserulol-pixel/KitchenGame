@@ -11,6 +11,15 @@ public class GridPositioningSystem : MonoBehaviour
     [SerializeField] private Vector3 gridOrigin = Vector3.zero; // Начало координат сетки в мировом пространстве
     [SerializeField] private Vector2Int gridBounds = new Vector2Int(10, 10); // Размеры сетки для визуализации в редакторе
 
+    [Header("Видимая сетка в игре (не только в редакторе)")]
+    [Tooltip("OnDrawGizmos ниже виден только в Scene view редактора — во время игры/в билде нужна отдельная отрисовка")]
+    [SerializeField] private bool showGridOnlyDuringPreparation = true;
+    [SerializeField] private Material gridLineMaterial;
+    [SerializeField] private Color gridLineColor = new Color(0f, 1f, 1f, 0.5f);
+    [SerializeField] private float gridLineWidth = 0.03f;
+
+    private GameObject gridLinesContainer;
+
     // Словарь занятых ячеек. Хранит координаты и ссылку на объект, который её занимает
     private Dictionary<Vector2Int, BaseCounter> occupiedCells = new Dictionary<Vector2Int, BaseCounter>();
 
@@ -24,6 +33,70 @@ public class GridPositioningSystem : MonoBehaviour
         {
             Destroy(gameObject);
         }
+
+        BuildGridVisualization();
+    }
+
+    private void Update()
+    {
+        if (gridLinesContainer == null || !showGridOnlyDuringPreparation) return;
+
+        bool shouldShow = GameLoopManager.Instance != null && GameLoopManager.Instance.IsPreparationActive();
+
+        if (gridLinesContainer.activeSelf != shouldShow)
+        {
+            gridLinesContainer.SetActive(shouldShow);
+        }
+    }
+
+    /// <summary>
+    /// Строит сетку из LineRenderer'ов один раз при старте — сами линии не меняются
+    /// (cellSize/gridBounds фиксированы для сцены), меняется только видимость контейнера.
+    /// LineRenderer выбран не просто так: в отличие от GL.Lines, он одинаково работает
+    /// в любом render pipeline без написания под него отдельного шейдера.
+    /// </summary>
+    private void BuildGridVisualization()
+    {
+        gridLinesContainer = new GameObject("GridLinesVisual");
+        gridLinesContainer.transform.SetParent(transform);
+
+        // Линии вдоль оси Z — по одной на каждое значение X от 0 до gridBounds.x включительно
+        for (int x = 0; x <= gridBounds.x; x++)
+        {
+            float worldX = gridOrigin.x + x * cellSize;
+            Vector3 start = new Vector3(worldX, gridOrigin.y + 0.02f, gridOrigin.z);
+            Vector3 end = new Vector3(worldX, gridOrigin.y + 0.02f, gridOrigin.z + gridBounds.y * cellSize);
+            CreateGridLine(start, end);
+        }
+
+        // Линии вдоль оси X — по одной на каждое значение Z от 0 до gridBounds.y включительно
+        for (int z = 0; z <= gridBounds.y; z++)
+        {
+            float worldZ = gridOrigin.z + z * cellSize;
+            Vector3 start = new Vector3(gridOrigin.x, gridOrigin.y + 0.02f, worldZ);
+            Vector3 end = new Vector3(gridOrigin.x + gridBounds.x * cellSize, gridOrigin.y + 0.02f, worldZ);
+            CreateGridLine(start, end);
+        }
+    }
+
+    private void CreateGridLine(Vector3 start, Vector3 end)
+    {
+        GameObject lineObj = new GameObject("GridLine");
+        lineObj.transform.SetParent(gridLinesContainer.transform);
+
+        LineRenderer lr = lineObj.AddComponent<LineRenderer>();
+        lr.positionCount = 2;
+        lr.SetPosition(0, start);
+        lr.SetPosition(1, end);
+        lr.startWidth = gridLineWidth;
+        lr.endWidth = gridLineWidth;
+        lr.useWorldSpace = true;
+
+        // Запасной материал, чтобы линии были видны сразу, без ручной настройки —
+        // но для билда надёжнее назначить gridLineMaterial самим, под свой render pipeline.
+        lr.material = gridLineMaterial != null ? gridLineMaterial : new Material(Shader.Find("Sprites/Default"));
+        lr.startColor = gridLineColor;
+        lr.endColor = gridLineColor;
     }
 
     /// <summary>

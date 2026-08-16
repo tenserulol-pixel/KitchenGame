@@ -104,7 +104,12 @@ public class DeliveryManager : MonoBehaviour
 
                     if (GameLoopManager.Instance != null)
                     {
-                        GameLoopManager.Instance.AddOrderGold(order.recipeSO.Cost);
+                        int payout = order.recipeSO.Cost;
+                        if (Player.Instance != null)
+                        {
+                            payout = Mathf.RoundToInt(payout * Player.Instance.GetRecipeCostMultiplier());
+                        }
+                        GameLoopManager.Instance.AddOrderGold(payout);
                     }
 
                     OnRecipeCompleted?.Invoke(this, EventArgs.Empty);

@@ -105,8 +105,37 @@ public class Player : MonoBehaviour, IKitchenObjectParent
             {
                 sinkCounter.SetWashingState(isHeld);
             }
+            // Для лужи (уборка держанием F)
+            else if (selectedCounter is Puddle puddle)
+            {
+                puddle.SetCleaningState(isHeld);
+            }
             // Для других столов, поддерживающих удержание, добавляйте аналогично
         }
+    }
+
+    /// <summary>
+    /// Множитель скорости от близости к лужам (Puddle.ActivePuddles) — 1, если рядом
+    /// ни одной нет. Если игрок оказался в радиусе НЕСКОЛЬКИХ луж сразу, замедления не
+    /// перемножаются — берётся только самое сильное, иначе можно было бы застрять почти
+    /// неподвижно на пересечении пары луж, что ощущалось бы как баг, а не как риск.
+    /// </summary>
+    private float GetPuddleSpeedMultiplier()
+    {
+        float strongestMultiplier = 1f;
+
+        foreach (Puddle puddle in Puddle.ActivePuddles)
+        {
+            if (puddle == null) continue;
+
+            float distance = Vector3.Distance(transform.position, puddle.transform.position);
+            if (distance <= puddle.GetSlowRadius())
+            {
+                strongestMultiplier = Mathf.Min(strongestMultiplier, puddle.GetSlowMultiplier());
+            }
+        }
+
+        return strongestMultiplier;
     }
 
     /// <summary>
@@ -118,7 +147,7 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         Vector2 inputVector = GameInput.Instance != null ? GameInput.Instance.GetMovementVectorNormalized() : Vector2.zero;
         Vector3 moveDir = new Vector3(inputVector.x, 0f, inputVector.y);
 
-        float moveDistance = moveSpeed * Time.deltaTime;
+        float moveDistance = moveSpeed * GetPuddleSpeedMultiplier() * Time.deltaTime;
 
         // Проверяем, может ли игрок двигаться в заданном направлении (капсульный каст)
         bool canMove = !Physics.CapsuleCast(
@@ -375,6 +404,24 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     // поэтому геттер+сеттер тут был бы менее удобен, чем явный "увеличить на".
     public void IncreaseMoveSpeed(float amount) => moveSpeed += amount;
     public void IncreaseInteractDistance(float amount) => interactDistance += amount;
+
+    [Header("Модификаторы резки от карт улучшений")]
+    [Tooltip("1 = обычная скорость резки. Нестабильная магия и подобные карты прибавляют сюда.")]
+    [SerializeField] private float cuttingSpeedMultiplier = 1f;
+    [Tooltip("Шанс (0..1) испортить ингредиент при завершении резки — по умолчанию 0, без риска.")]
+    [SerializeField] private float cuttingRuinChance = 0f;
+
+    public void IncreaseCuttingSpeedMultiplier(float amount) => cuttingSpeedMultiplier += amount;
+    public void IncreaseCuttingRuinChance(float amount) => cuttingRuinChance += amount;
+    public float GetCuttingSpeedMultiplier() => cuttingSpeedMultiplier;
+    public float GetCuttingRuinChance() => cuttingRuinChance;
+
+    [Header("Модификатор цены рецептов от карт улучшений")]
+    [Tooltip("1 = обычная цена. Применяется в момент выплаты в DeliveryManager, не мутирует сам RecipeSO.")]
+    [SerializeField] private float recipeCostMultiplier = 1f;
+
+    public void IncreaseRecipeCostMultiplier(float amount) => recipeCostMultiplier += amount;
+    public float GetRecipeCostMultiplier() => recipeCostMultiplier;
 
     // === РЕАЛИЗАЦИЯ ИНТЕРФЕЙСА IKITCHENOBJECTPARENT (Для переноски предметов) ===
 

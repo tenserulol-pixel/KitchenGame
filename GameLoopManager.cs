@@ -261,6 +261,23 @@ public class GameLoopManager : MonoBehaviour
     // Для UpgradeManager — карта "терпимость к недовольным" поднимает порог поражения.
     public void IncreaseAngryCustomerTolerance(int amount) => maxAngryCustomersPerDay += amount;
 
+    // Для карты "Мягкая рука" — снижает штраф за проваленный заказ, не ниже нуля
+    // (отрицательный штраф означал бы получать деньги за провал, что не имеет смысла).
+    public void ReducePenaltyPerOrder(int amount) => basePenaltyPerOrder = Mathf.Max(0, basePenaltyPerOrder - amount);
+
+    // Для карты "Задаток покровителя" — разовая прибавка к накопленному золоту в момент
+    // взятия карты, а не постоянный множитель. В отличие от AddOrderGold, не идёт через
+    // дневную статистику (goldEarnedToday) — это не заработок за смену, а сам факт карты.
+    public void AddBonusGold(int amount)
+    {
+        totalGold += amount;
+
+        OnGoldChanged?.Invoke(this, new OnGoldChangedEventArgs {
+            currentTotalGold = totalGold + (goldEarnedToday - goldLostToday),
+            changeAmount = amount
+        });
+    }
+
     // Вспомогательные методы проверки текущих состояний игры
     public bool IsPreparationActive() => state == State.DayPreparation;
     public bool IsGamePlaying() => state == State.GamePlaying;

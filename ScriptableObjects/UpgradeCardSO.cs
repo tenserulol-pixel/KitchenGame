@@ -1,14 +1,22 @@
 using UnityEngine;
 
-// Небольшой, сознательно ограниченный набор эффектов для первой версии — все три
-// трогают простое поле на Player/GameLoopManager, а не общий ScriptableObject-рецепт.
-// Скорость резки/варки (CuttingRecipeSO/FryingRecipeSO) сюда пока не входит —
-// это отдельная задача, поскольку эти значения общие на все счётчики сразу.
+// Небольшой, сознательно ограниченный набор эффектов — каждый трогает одно простое
+// поле на конкретном скрипте, а не общий ScriptableObject-рецепт (кроме случая с
+// ценой рецептов ниже — там множитель применяется в момент выплаты, а не в самом
+// RecipeSO, чтобы не мутировать общий на всех ассет).
+//
+// UnstableMagic и DarkDeal используют secondaryValue — единственные два эффекта
+// с двумя числами вместо одного.
 public enum UpgradeEffectType
 {
     MoveSpeed,
     InteractDistance,
     AngryCustomerTolerance,
+    UnstableMagic,
+    PenaltyReduction,     // Мягкая рука — снижает штраф за недовольного клиента
+    BonusGold,            // Задаток покровителя — разовая прибавка золота при взятии карты
+    SlowerQuotaGrowth,    // Щедрый день — снижает прирост дневной нормы групп
+    DarkDeal,             // Тёмная сделка — цена рецептов выше (value), терпимость ниже (secondaryValue)
 }
 
 [CreateAssetMenu]
@@ -18,4 +26,6 @@ public class UpgradeCardSO : ScriptableObject
     [TextArea] public string description;
     public UpgradeEffectType effectType;
     public float value;
+    [Tooltip("Нужно не всем эффектам — используется UnstableMagic и DarkDeal")]
+    public float secondaryValue;
 }

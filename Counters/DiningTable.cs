@@ -17,7 +17,7 @@ public class DiningTable : BaseCounter
     [Header("Настройки стульев")]
     [SerializeField] private Chair[] chairs;
 
-    // Стулья, убранные через RemoveNearestChair — ждут возврата через ReturnStoredChair
+    // Стулья, убранные через E (см. ToggleNearestChair) — ждут возврата тем же способом
     private readonly List<Chair> storedChairs = new List<Chair>();
 
     [Header("Настройки Грязной Посуды")]
@@ -221,23 +221,6 @@ public class DiningTable : BaseCounter
         return false;
     }
 
-    /// <summary>
-    /// Переключатель "убрать/вернуть стул" на одну кнопку — E. Если сейчас есть убранный
-    /// (отложенный) стул, возвращает последний из них; если нет — убирает ближайший
-    /// свободный. Объединяет то, что раньше делали Delete и Insert по отдельности.
-    /// </summary>
-    public void ToggleNearestChair(Vector3 fromPosition)
-    {
-        if (storedChairs.Count > 0)
-        {
-            ReturnStoredChair();
-        }
-        else
-        {
-            RemoveNearestChair(fromPosition);
-        }
-    }
-
     public override void Interact(Player player)
     {
         if (player == null) return;
@@ -356,15 +339,11 @@ public class DiningTable : BaseCounter
     public Chair[] GetChairs() => chairs;
 
     /// <summary>
-    /// Убирает стул, ближайший к указанной мировой позиции (обычно — позиция игрока),
-    /// и откладывает его (а не уничтожает) — чтобы позже можно было вернуть тем же
-    /// стулом через ReturnStoredChair(). Массив chairs пересобирается без него, а не
-    /// просто зануляется — HasFreeChair()/GetFreeChair() выше по файлу не проверяют
-    /// chairs на null, так что оставлять "дыры" в массиве было бы риском вылета в рантайме.
+    /// Ищет ближайший к указанной позиции СВОБОДНЫЙ (на месте) стул, ничего не меняя.
     /// </summary>
-    public void RemoveNearestChair(Vector3 fromPosition)
+    public Chair GetNearestFreeChair(Vector3 fromPosition)
     {
-        if (chairs == null || chairs.Length == 0) return;
+        if (chairs == null || chairs.Length == 0) return null;
 
         Chair nearest = null;
         float nearestDistance = float.MaxValue;
@@ -381,46 +360,196 @@ public class DiningTable : BaseCounter
             }
         }
 
-        if (nearest == null) return;
+        return nearest;
+    }
+
+    /// <summary>
+    /// Ищет ближайший к указанной позиции УБРАННЫЙ (отложенный) стул. Стул неактивен,
+    /// но его transform.position всё равно доступен для запроса — SetActive(false)
+    /// не обнуляет позицию, просто выключает рендер/коллайдер/обновления.
+    /// </summary>
+    public Chair GetNearestStoredChair(Vector3 fromPosition)
+    {
+        if (storedChairs.Count == 0) return null;
+
+        Chair nearest = null;
+        float nearestDistance = float.MaxValue;
+
+        foreach (Chair chair in storedChairs)
+        {
+            if (chair == null) continue;
+
+            float distance = Vector3.Distance(chair.transform.position, fromPosition);
+            if (distance < nearestDistance)
+            {
+                nearestDistance = distance;
+                nearest = chair;
+            }
+        }
+
+        return nearest;
+    }
+
+    /// <summary>
+    /// Решает, что должно произойти при нажатии E рядом с указанной позицией: убрать
+    /// ближайший стул на месте или вернуть ближайший убранный — смотря что физически
+    /// ближе к игроку прямо сейчас. Общая точка правды и для ToggleNearestChair(),
+    /// и для подсветки (IsRemoveTarget) — чтобы они не могли разойтись между собой.
+    /// </summary>
+    private Chair GetCurrentChairActionTarget(Vector3 fromPosition, out bool isRemove)
+    {
+        Chair nearestFree = GetNearestFreeChair(fromPosition);
+        Chair nearestStored = GetNearestStoredChair(fromPosition);
+
+        if (nearestFree == null && nearestStored == null)
+        {
+            isRemove = false;
+            return null;
+        }
+
+        float freeDistance = nearestFree != null ? Vector3.Distance(nearestFree.transform.position, fromPosition) : float.MaxValue;
+        float storedDistance = nearestStored != null ? Vector3.Distance(nearestStored.transform.position, fromPosition) : float.MaxValue;
+
+        if (storedDistance < freeDistance)
+        {
+            isRemove = false;
+            return nearestStored;
+        }
+
+        isRemove = true;
+        return nearestFree;
+    }
+
+    /// <summary>
+    /// Убирает/возвращает стул, смотря что ближе к игроку — по одной кнопке E можно
+    /// убрать НЕСКОЛЬКО разных стульев подряд (просто подходя к каждому по очереди),
+    /// а не только один: раньше любой отложенный стул блокировал повторное убирание,
+    /// теперь решение принимается per-стулу, а не "есть ли вообще что-то отложенное".
+    /// </summary>
+    public void ToggleNearestChair(Vector3 fromPosition)
+    {
+        Chair target = GetCurrentChairActionTarget(fromPosition, out bool isRemove);
+
+        if (target == null)
+        {
+            Debug.Log($"[DiningTable] '{name}': стульев нет вообще — ни на месте, ни убранных.");
+            return;
+        }
+
+        if (isRemove)
+        {
+            RemoveSpecificChair(target);
+        }
+        else
+        {
+            ReturnSpecificChair(target);
+        }
+    }
+
+    /// <summary>
+    /// Для подсветки (ChairHighlightVisual): является ли конкретный стул тем, который
+    /// уберётся при нажатии E прямо сейчас.
+    /// </summary>
+    public bool IsRemoveTarget(Chair chair, Vector3 fromPosition)
+    {
+        Chair target = GetCurrentChairActionTarget(fromPosition, out bool isRemove);
+        return isRemove && target == chair;
+    }
+
+    /// <summary>
+    /// Убирает конкретный стул (а не "ближайший к позиции") и откладывает его —
+    /// чтобы позже можно было вернуть тем же стулом. Массив chairs пересобирается
+    /// без него, а не просто зануляется — HasFreeChair()/GetFreeChair() выше по файлу
+    /// не проверяют chairs на null, дыра в массиве была бы риском вылета в рантайме.
+    /// </summary>
+    private void RemoveSpecificChair(Chair chair)
+    {
+        if (chair == null) return;
 
         List<Chair> remaining = new List<Chair>(chairs);
-        remaining.Remove(nearest);
+        if (!remaining.Remove(chair)) return;
         chairs = remaining.ToArray();
 
         // Стул остаётся дочерним объектом стола (просто неактивным), поэтому его позиция
         // относительно стола не теряется — даже если стол потом передвинут, стул при
         // возврате появится там же, где и должен, без отдельного хранения координат.
-        nearest.gameObject.SetActive(false);
-        storedChairs.Add(nearest);
+        chair.gameObject.SetActive(false);
+        storedChairs.Add(chair);
 
-        Debug.Log($"[DiningTable] '{name}': стул убран (можно вернуть), осталось мест — {chairs.Length}.");
+        Debug.Log($"[DiningTable] '{name}': стул убран, осталось мест — {chairs.Length}.");
     }
 
     /// <summary>
-    /// Возвращает последний убранный стул (LIFO — "отменить последнее убирание").
-    /// Стул всё это время оставался дочерним объектом стола, просто неактивным,
-    /// поэтому позиция относительно стола не потерялась, даже если стол успели
-    /// передвинуть через FurnitureMovingController.
+    /// Возвращает конкретный убранный стул (а не обязательно последний по очереди).
     /// </summary>
-    public void ReturnStoredChair()
+    private void ReturnSpecificChair(Chair chair)
     {
-        if (storedChairs.Count == 0)
-        {
-            Debug.Log($"[DiningTable] '{name}': нет убранных стульев, нечего возвращать.");
-            return;
-        }
+        if (chair == null) return;
+        if (!storedChairs.Remove(chair)) return;
 
-        Chair returning = storedChairs[storedChairs.Count - 1];
-        storedChairs.RemoveAt(storedChairs.Count - 1);
-
-        returning.gameObject.SetActive(true);
+        chair.gameObject.SetActive(true);
 
         List<Chair> updated = new List<Chair>(chairs);
-        updated.Add(returning);
+        updated.Add(chair);
         chairs = updated.ToArray();
 
         Debug.Log($"[DiningTable] '{name}': стул возвращён, мест теперь — {chairs.Length}.");
     }
 
     public int GetStoredChairCount() => storedChairs.Count;
+
+    [Header("Проверка места для стульев (после переноса стола)")]
+    [Tooltip("Радиус проверки — примерный физический размер стула")]
+    [SerializeField] private float chairFitCheckRadius = 0.3f;
+    [Tooltip("На какой высоте от пола проверяется место — чтобы не задеть коллайдер самого пола")]
+    [SerializeField] private float chairFitCheckHeightOffset = 0.4f;
+    [Tooltip("Какие слои считаются помехой; по умолчанию — все. Сузьте, если пол/декор даёт ложные срабатывания")]
+    [SerializeField] private LayerMask chairFitCheckMask = ~0;
+
+    /// <summary>
+    /// Физическая проверка через Physics.OverlapSphere — есть ли что-то постороннее
+    /// (стена, другой стол, прилавок) там, где сейчас стоит стул. Коллайдеры самого
+    /// стола и соседних стульев игнорируются через IsChildOf — все они дочерние
+    /// объекты этого же стола, иначе стул считал бы помехой собственный стол.
+    /// </summary>
+    private bool HasRoomForChair(Chair chair)
+    {
+        Vector3 checkPosition = chair.transform.position + Vector3.up * chairFitCheckHeightOffset;
+        Collider[] overlaps = Physics.OverlapSphere(checkPosition, chairFitCheckRadius, chairFitCheckMask);
+
+        foreach (Collider col in overlaps)
+        {
+            if (col.transform == chair.transform) continue;
+            if (col.transform == transform || col.transform.IsChildOf(transform)) continue;
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Вызывается FurnitureMovingController'ом сразу после того, как стол успешно
+    /// переставлен. Каждый текущий (не убранный ранее) стул проверяется физически —
+    /// если на новом месте стола рядом с его позицией что-то мешает, стул убирается
+    /// автоматически, тем же способом, что и вручную через E. Снимок списка нужен,
+    /// поскольку RemoveSpecificChair меняет chairs изнутри перебора.
+    /// </summary>
+    public void RemoveChairsWithoutRoom()
+    {
+        if (chairs == null || chairs.Length == 0) return;
+
+        List<Chair> chairsSnapshot = new List<Chair>(chairs);
+
+        foreach (Chair chair in chairsSnapshot)
+        {
+            if (chair == null) continue;
+
+            if (!HasRoomForChair(chair))
+            {
+                Debug.Log($"[DiningTable] '{name}': стулу не хватило места после переноса стола — убран автоматически.");
+                RemoveSpecificChair(chair);
+            }
+        }
+    }
 }
