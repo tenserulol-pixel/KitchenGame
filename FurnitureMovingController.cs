@@ -7,8 +7,9 @@ using UnityEngine;
 //// Управление:
 /// T — поднять выбранный объект / подтвердить новое место.
 /// Escape — отменить перенос и вернуть объект обратно.
-/// Delete — убрать ближайший (свободный) стул у выбранного стола.
-/// Insert — вернуть последний убранный стул у выбранного стола.
+///
+/// Переключение стульев (убрать/вернуть) сюда больше не входит — оно теперь
+/// висит на обычной кнопке E через DiningTable.Interact(), см. этот файл.
 /// </summary>
 public class FurnitureMovingController : MonoBehaviour
 {
@@ -20,8 +21,6 @@ public class FurnitureMovingController : MonoBehaviour
     [Header("Управление")]
     [SerializeField] private KeyCode moveFurnitureKey = KeyCode.T;
     [SerializeField] private KeyCode cancelKey = KeyCode.Escape;
-    [SerializeField] private KeyCode removeChairKey = KeyCode.Delete;
-    [SerializeField] private KeyCode returnChairKey = KeyCode.Insert;
 
     [Header("Настройки переноса")]
     [SerializeField] private float placementDistance = 2f;
@@ -58,14 +57,6 @@ public class FurnitureMovingController : MonoBehaviour
             if (Input.GetKeyDown(moveFurnitureKey))
             {
                 TryStartMoving();
-            }
-            else if (Input.GetKeyDown(removeChairKey))
-            {
-                TryRemoveNearestChair();
-            }
-            else if (Input.GetKeyDown(returnChairKey))
-            {
-                TryReturnChair();
             }
         }
         else
@@ -115,34 +106,6 @@ public class FurnitureMovingController : MonoBehaviour
         Debug.Log(
             $"[FurnitureMoving] '{movingCounter.name}' поднят. " +
             $"{moveFurnitureKey} — поставить, {cancelKey} — отменить.");
-    }
-
-    private void TryRemoveNearestChair()
-    {
-        if (Player.Instance == null)
-        {
-            return;
-        }
-
-        // Стул убирается у того стола, на который сейчас смотрит игрок — не нужен
-        // отдельный рейкаст по стульям, раз выбор стола уже решён Player.selectedCounter.
-        if (Player.Instance.GetSelectedCounter() is DiningTable table)
-        {
-            table.RemoveNearestChair(Player.Instance.transform.position);
-        }
-    }
-
-    private void TryReturnChair()
-    {
-        if (Player.Instance == null)
-        {
-            return;
-        }
-
-        if (Player.Instance.GetSelectedCounter() is DiningTable table)
-        {
-            table.ReturnStoredChair();
-        }
     }
 
     private void UpdateGhostPosition()

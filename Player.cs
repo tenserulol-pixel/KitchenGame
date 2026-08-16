@@ -371,6 +371,11 @@ public class Player : MonoBehaviour, IKitchenObjectParent
 
     public BaseCounter GetSelectedCounter() => selectedCounter;
 
+    // Для UpgradeManager — карты улучшений увеличивают эти значения, не задают напрямую,
+    // поэтому геттер+сеттер тут был бы менее удобен, чем явный "увеличить на".
+    public void IncreaseMoveSpeed(float amount) => moveSpeed += amount;
+    public void IncreaseInteractDistance(float amount) => interactDistance += amount;
+
     // === РЕАЛИЗАЦИЯ ИНТЕРФЕЙСА IKITCHENOBJECTPARENT (Для переноски предметов) ===
 
     public Transform GetKitchenObjectFollowTransform()

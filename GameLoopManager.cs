@@ -258,6 +258,9 @@ public class GameLoopManager : MonoBehaviour
 
     public bool HasEnoughMoney(int amount) => totalGold >= amount;
 
+    // Для UpgradeManager — карта "терпимость к недовольным" поднимает порог поражения.
+    public void IncreaseAngryCustomerTolerance(int amount) => maxAngryCustomersPerDay += amount;
+
     // Вспомогательные методы проверки текущих состояний игры
     public bool IsPreparationActive() => state == State.DayPreparation;
     public bool IsGamePlaying() => state == State.GamePlaying;

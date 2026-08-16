@@ -221,9 +221,38 @@ public class DiningTable : BaseCounter
         return false;
     }
 
+    /// <summary>
+    /// Переключатель "убрать/вернуть стул" на одну кнопку — E. Если сейчас есть убранный
+    /// (отложенный) стул, возвращает последний из них; если нет — убирает ближайший
+    /// свободный. Объединяет то, что раньше делали Delete и Insert по отдельности.
+    /// </summary>
+    public void ToggleNearestChair(Vector3 fromPosition)
+    {
+        if (storedChairs.Count > 0)
+        {
+            ReturnStoredChair();
+        }
+        else
+        {
+            RemoveNearestChair(fromPosition);
+        }
+    }
+
     public override void Interact(Player player)
     {
         if (player == null) return;
+
+        // В фазе подготовки, с пустыми руками, E на столе переключает ближайший стул
+        // (убрать/вернуть) вместо обычной подачи блюда — подавать всё равно некому,
+        // клиентов в этой фазе не бывает. Если в руках что-то есть — ведём себя как раньше,
+        // мало ли для чего это понадобится (например, забрать что-то со стола).
+        if (GameLoopManager.Instance != null
+            && GameLoopManager.Instance.IsPreparationActive()
+            && !player.HasKitchenObject())
+        {
+            ToggleNearestChair(player.transform.position);
+            return;
+        }
 
         // === СОСТОЯНИЕ 1: ЗА СТОЛОМ СИДЯТ КЛИЕНТЫ ===
         if (IsOccupied())
