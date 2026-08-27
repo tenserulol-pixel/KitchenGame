@@ -412,7 +412,13 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     [SerializeField] private float cuttingRuinChance = 0f;
 
     public void IncreaseCuttingSpeedMultiplier(float amount) => cuttingSpeedMultiplier += amount;
-    public void IncreaseCuttingRuinChance(float amount) => cuttingRuinChance += amount;
+
+    // Зажимаем в [0..1]: иначе при многократном взятии карты "Нестабильная магия"
+    // шанс уходит >1, и Random.value < ruinChance срабатывает ВСЕГДА — карта начинает
+    // безусловно портить ингредиент, что явно не задумывалось.
+    public void IncreaseCuttingRuinChance(float amount) =>
+        cuttingRuinChance = Mathf.Clamp01(cuttingRuinChance + amount);
+
     public float GetCuttingSpeedMultiplier() => cuttingSpeedMultiplier;
     public float GetCuttingRuinChance() => cuttingRuinChance;
 

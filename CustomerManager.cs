@@ -11,6 +11,12 @@ public class CustomerManager : MonoBehaviour
     [SerializeField] private Transform spawnPoint;
     [SerializeField] private float spawnInterval = 15f;
 
+    [Header("Очередь (когда свободных столов нет)")]
+    [Tooltip("Точки, где стоят группы в очереди — по одной на группу, не на человека (участники группы становятся с небольшим случайным разбросом рядом с точкой). Если групп в очереди больше, чем точек, лишние выстраиваются друг за другом позади точки спавна.")]
+    [SerializeField] private Transform[] queuePositions;
+
+    private readonly List<List<CustomerAI>> queuedGroups = new List<List<CustomerAI>>();
+
     [Header("Limits")]
     [SerializeField] private int maxCustomers = 20;
     [SerializeField] private int minGroupSize = 1;
@@ -127,6 +133,8 @@ public class CustomerManager : MonoBehaviour
             spawnTimer = 0f;
             TrySpawnCustomerGroup();
         }
+
+        TryPromoteFromQueue();
     }
 
     private void TrySpawnCustomerGroup()
@@ -140,17 +148,10 @@ public class CustomerManager : MonoBehaviour
 
         int groupSize = UnityEngine.Random.Range(minGroupSize, maxGroupSize + 1);
 
-        // Не превышаем лимит клиентов
+        // Не превышаем лимит клиентов — очередь тоже физически занимает место в заведении,
+        // поэтому считается наравне с уже рассаженными, а не отдельно.
         if (customerList.Count + groupSize > maxCustomers)
         {
-            return;
-        }
-
-        DiningTable table = FindAvailableTable(groupSize);
-
-        if (table == null)
-        {
-            Debug.Log($"Нет стола для группы из {groupSize} человек.");
             return;
         }
 
@@ -176,10 +177,100 @@ public class CustomerManager : MonoBehaviour
             customerList.Add(customer);
         }
 
-        table.OccupyTable(group);
+        // Раньше при отсутствии стола группа вообще не создавалась (и не засчитывалась
+        // в дневную норму). Теперь она в любом случае "приходит" — либо сразу садится,
+        // либо встаёт в очередь ждать; норма засчитывается за сам факт прихода, а не
+        // за то, что сразу нашёлся стол.
+        DiningTable table = FindAvailableTable(groupSize);
+
+        if (table != null)
+        {
+            table.OccupyTable(group);
+        }
+        else
+        {
+            SendGroupToQueue(group);
+        }
+
         groupsSpawnedToday++;
 
         Debug.Log($"Создана группа из {groupSize} человек. Групп сегодня: {groupsSpawnedToday}/{dailyGroupTarget}.");
+    }
+
+    /// <summary>
+    /// Отправляет группу на ближайшую свободную точку очереди вместо стола — каждый
+    /// участник идёт туда своим NavMeshAgent'ом (через CustomerAI.SetTargetQueueSpot),
+    /// с небольшим случайным разбросом, чтобы не стоять друг в друге.
+    /// </summary>
+    private void SendGroupToQueue(List<CustomerAI> group)
+    {
+        Vector3 queuePosition = GetQueueSlotPosition(queuedGroups.Count);
+
+        foreach (CustomerAI customer in group)
+        {
+            Vector3 offset = new Vector3(
+                UnityEngine.Random.Range(-0.4f, 0.4f),
+                0f,
+                UnityEngine.Random.Range(-0.4f, 0.4f)
+            );
+
+            customer.SetTargetQueueSpot(queuePosition + offset);
+        }
+
+        queuedGroups.Add(group);
+
+        Debug.Log($"[CustomerManager] Свободных столов нет — группа встала в очередь. Групп в очереди: {queuedGroups.Count}.");
+    }
+
+    private Vector3 GetQueueSlotPosition(int slotIndex)
+    {
+        if (queuePositions != null && slotIndex < queuePositions.Length && queuePositions[slotIndex] != null)
+        {
+            return queuePositions[slotIndex].position;
+        }
+
+        // Запасной вариант, если размеченных точек очереди не хватило или их вообще нет —
+        // выстраиваемся друг за другом позади точки спавна, а не падаем с NullReferenceException.
+        Vector3 basePosition = spawnPoint != null ? spawnPoint.position : Vector3.zero;
+        return basePosition - Vector3.forward * (slotIndex + 1) * 1.5f;
+    }
+
+    /// <summary>
+    /// Каждый кадр проверяет, не освободился ли стол для группы, стоящей в очереди
+    /// дольше всех (FIFO) — если да, пересаживает её. Ранний выход при пустой очереди
+    /// делает эту проверку практически бесплатной в обычной игре, когда очередь пуста.
+    /// </summary>
+    private void TryPromoteFromQueue()
+    {
+        if (queuedGroups.Count == 0) return;
+
+        List<CustomerAI> nextGroup = queuedGroups[0];
+        DiningTable table = FindAvailableTable(nextGroup.Count);
+
+        if (table == null) return;
+
+        queuedGroups.RemoveAt(0);
+        table.OccupyTable(nextGroup);
+
+        Debug.Log($"[CustomerManager] Стол освободился — группа из очереди рассажена. Осталось в очереди: {queuedGroups.Count}.");
+    }
+
+    /// <summary>
+    /// Вызывается CustomerAI, когда у одного из членов группы в очереди кончилось терпение.
+    /// Вся группа уходит вместе — тот же принцип, что уже работает у рассаженных групп
+    /// в DiningTable.OnCustomerLeft (один недовольный утягивает за собой всех остальных).
+    /// </summary>
+    public void DisbandQueuedGroup(CustomerAI triggeringCustomer)
+    {
+        List<CustomerAI> group = queuedGroups.Find(g => g.Contains(triggeringCustomer));
+        if (group == null) return;
+
+        queuedGroups.Remove(group);
+
+        foreach (CustomerAI customer in group)
+        {
+            customer.LeaveQueue();
+        }
     }
 
     private DiningTable FindAvailableTable(int groupSize)
@@ -219,9 +310,52 @@ public class CustomerManager : MonoBehaviour
     public int GetDailyGroupTarget() => dailyGroupTarget;
 
     // Для карты "Щедрый день" — снижает, насколько быстро растёт дневная норма групп
-    // по дням, не ниже нуля (отрицательный прирост означал бы, что норма со временем
-    // сама уменьшается, что не было целью карты).
-    public void ReduceDailyGroupTargetGrowth(int amount) =>
+    // по дням, не ниже нуля.
+    public void ReduceDailyGroupTargetGrowth(int amount)
+    {
         dailyGroupTargetIncreasePerDay = Mathf.Max(0, dailyGroupTargetIncreasePerDay - amount);
+        ReapplyCurrentDayDifficulty();
+    }
+
+    // Ниже — карты со сложными эффектами, каждая трогает ДВЕ базовые величины сразу,
+    // в противоход друг другу. Важно: меняем именно base*-поля (baseMaxGroupSize,
+    // baseDailyGroupTarget и т.д.), а не maxGroupSize/dailyGroupTarget/spawnInterval
+    // напрямую — те заново считаются из base*-полей при каждом ApplyDayDifficulty(),
+    // и прямая правка стёрлась бы сама в момент наступления следующего дня.
+    // ReapplyCurrentDayDifficulty() сразу же пересчитывает текущий день от новых
+    // base*-значений — иначе эффект карты проявился бы только со следующего дня,
+    // а не с того момента, когда её взяли.
+
+    /// <summary>Для карты "Крупные компании" — группы больше, но их меньше за день.</summary>
+    public void IncreaseBaseMaxGroupSize(int amount)
+    {
+        baseMaxGroupSize += amount;
+        ReapplyCurrentDayDifficulty();
+    }
+
+    public void DecreaseBaseDailyGroupTarget(int amount)
+    {
+        baseDailyGroupTarget = Mathf.Max(1, baseDailyGroupTarget - amount);
+        ReapplyCurrentDayDifficulty();
+    }
+
+    /// <summary>Для карты "Час пик" — клиенты идут чаще, но зал вмещает меньше разом.</summary>
+    public void DecreaseBaseSpawnInterval(float amount)
+    {
+        baseSpawnInterval = Mathf.Max(minSpawnInterval, baseSpawnInterval - amount);
+        ReapplyCurrentDayDifficulty();
+    }
+
+    public void DecreaseBaseMaxCustomers(int amount)
+    {
+        baseMaxCustomers = Mathf.Max(1, baseMaxCustomers - amount);
+        ReapplyCurrentDayDifficulty();
+    }
+
+    private void ReapplyCurrentDayDifficulty()
+    {
+        int currentDay = GameLoopManager.Instance != null ? GameLoopManager.Instance.GetCurrentDay() : 1;
+        ApplyDayDifficulty(currentDay);
+    }
     public float GetDailyProgressNormalized() => dailyGroupTarget > 0 ? (float)groupsSpawnedToday / dailyGroupTarget : 1f;
 }

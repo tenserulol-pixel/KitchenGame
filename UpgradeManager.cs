@@ -166,6 +166,22 @@ public class UpgradeManager : MonoBehaviour
                 if (GameLoopManager.Instance != null)
                     GameLoopManager.Instance.IncreaseAngryCustomerTolerance(Mathf.RoundToInt(card.secondaryValue));
                 break;
+
+            case UpgradeEffectType.BiggerRarerGroups:
+                if (CustomerManager.Instance != null)
+                {
+                    CustomerManager.Instance.IncreaseBaseMaxGroupSize(Mathf.RoundToInt(card.value));
+                    CustomerManager.Instance.DecreaseBaseDailyGroupTarget(Mathf.RoundToInt(card.secondaryValue));
+                }
+                break;
+
+            case UpgradeEffectType.RushHour:
+                if (CustomerManager.Instance != null)
+                {
+                    CustomerManager.Instance.DecreaseBaseSpawnInterval(card.value);
+                    CustomerManager.Instance.DecreaseBaseMaxCustomers(Mathf.RoundToInt(card.secondaryValue));
+                }
+                break;
         }
     }
 

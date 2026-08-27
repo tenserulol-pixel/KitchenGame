@@ -12,7 +12,9 @@ public class CustomerAI : MonoBehaviour
         WaitingForFood,
         Eating,
         FinishedEating, // Ожидание окончания трапезы остальными членами группы
-        Leaving
+        Leaving,
+        WalkingToQueue, // Идёт к месту в очереди (свободного стола не нашлось)
+        Queueing        // Стоит в очереди, ждёт освободившийся стол — терпение тикает отдельно
     }
 
     public event EventHandler OnStateChanged;
@@ -20,6 +22,8 @@ public class CustomerAI : MonoBehaviour
     [Header("Настройки времени")]
     [SerializeField] private float eatingTime = 10f;
     [SerializeField] private float maxPatience = 60f;
+    [Tooltip("Отдельное от maxPatience значение — сколько группа готова стоять в очереди без стола")]
+    [SerializeField] private float maxQueuePatience = 30f;
 
     [Header("Заказы")]
     [SerializeField] private RecipeListSO recipeListSO;
@@ -36,6 +40,7 @@ public class CustomerAI : MonoBehaviour
     private RecipeSO orderedRecipe;
 
     private float patienceTimer;
+    private float queuePatienceTimer;
     private float eatingTimer;
 
     private GameObject orderVisualInstance;
@@ -74,6 +79,14 @@ public class CustomerAI : MonoBehaviour
                 break;
 
             case CustomerState.Leaving:
+                break;
+
+            case CustomerState.WalkingToQueue:
+                UpdateWalkingToQueue();
+                break;
+
+            case CustomerState.Queueing:
+                UpdateQueueing();
                 break;
         }
     }
@@ -127,6 +140,10 @@ public class CustomerAI : MonoBehaviour
 
     /// <summary>
     /// Устанавливает стул и стол-цель для данного клиента и отправляет его туда.
+    /// Явно переключает состояние на Walking — важно не только для только что
+    /// заспавненных (для них это и так сделает Start()), но и для клиента, которого
+    /// пересаживают из очереди: без этого он остался бы в состоянии Queueing и
+    /// никогда бы не пошёл к новому месту, несмотря на то что агенту уже задали путь.
     /// </summary>
     public void SetTargetSeat(Chair chair, DiningTable table)
     {
@@ -153,6 +170,95 @@ public class CustomerAI : MonoBehaviour
                 transform.position = chair.GetPosition();
             }
         }
+
+        SetState(CustomerState.Walking);
+    }
+
+    /// <summary>
+    /// Отправляет клиента к точке в очереди вместо стула — вызывается CustomerManager,
+    /// когда свободного стола не нашлось при спавне группы.
+    /// </summary>
+    public void SetTargetQueueSpot(Vector3 queuePosition)
+    {
+        if (agent != null)
+        {
+            agent.enabled = true;
+            if (agent.isOnNavMesh)
+            {
+                agent.SetDestination(queuePosition);
+            }
+            else
+            {
+                Debug.LogWarning($"[CustomerAI] Объект {name} заспавнился вне сетки NavMesh! Пожалуйста, запеките навигацию (Navigation window).");
+                transform.position = queuePosition;
+            }
+        }
+
+        SetState(CustomerState.WalkingToQueue);
+    }
+
+    private void UpdateWalkingToQueue()
+    {
+        if (agent.enabled && !agent.pathPending && agent.remainingDistance <= 0.2f)
+        {
+            queuePatienceTimer = maxQueuePatience;
+            SetState(CustomerState.Queueing);
+        }
+    }
+
+    private void UpdateQueueing()
+    {
+        queuePatienceTimer -= Time.deltaTime;
+
+        if (queuePatienceTimer <= 0f)
+        {
+            LeaveQueueAngry();
+        }
+    }
+
+    /// <summary>
+    /// Терпение в очереди кончилось у ЭТОГО конкретного клиента — штраф начисляется
+    /// один раз, а вся группа уходит вместе (см. CustomerManager.DisbandQueuedGroup),
+    /// тем же принципом, что уже работает у рассаженных групп в DiningTable.
+    /// </summary>
+    private void LeaveQueueAngry()
+    {
+        if (GameLoopManager.Instance != null)
+        {
+            GameLoopManager.Instance.DeductOrderGold();
+        }
+
+        if (CustomerManager.Instance != null)
+        {
+            CustomerManager.Instance.DisbandQueuedGroup(this);
+        }
+    }
+
+    /// <summary>
+    /// Уход конкретно из очереди — без стула, стола и заказа, поэтому не переиспользует
+    /// LeaveTable() напрямую (та явно рассчитана на уже посаженных гостей). Публичный,
+    /// поскольку вызывается для КАЖДОГО члена расформировываемой группы из CustomerManager,
+    /// включая тех, кто сам ещё не терял терпение — их просто утянули за собой.
+    /// </summary>
+    public void LeaveQueue()
+    {
+        SetState(CustomerState.Leaving);
+
+        if (CustomerManager.Instance != null)
+        {
+            CustomerManager.Instance.RemoveCustomer(this);
+        }
+
+        if (agent != null)
+        {
+            agent.enabled = true;
+            if (agent.isOnNavMesh)
+            {
+                agent.SetDestination(Vector3.zero); // Направление к выходу
+            }
+        }
+
+        Destroy(gameObject, 5f);
     }
 
     private void SitDown()
@@ -306,5 +412,6 @@ public class CustomerAI : MonoBehaviour
 
     public CustomerState GetState() => state;
     public float GetPatienceNormalized() => patienceTimer / maxPatience;
+    public float GetQueuePatienceNormalized() => queuePatienceTimer / maxQueuePatience;
     public RecipeSO GetOrderedRecipe() => orderedRecipe;
 }
