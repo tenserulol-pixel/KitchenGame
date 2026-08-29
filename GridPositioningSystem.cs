@@ -1,6 +1,12 @@
 using UnityEngine;
 using System.Collections.Generic;
 
+// ExecuteAlways: Awake/OnEnable/OnDisable вызываются и в edit mode, и в play mode.
+// Это позволяет Editor-скриптам дёргать Instance и методы GetGridPosition/GetWorldPosition
+// прямо из редактора (например, для снапа стола к сетке при перетаскивании мышью).
+// Словарь occupiedCells в редакторе НЕ заполняется — это нужно только для play mode,
+// чтобы не было ложных конфликтов между объектами в редакторе и при запуске игры.
+[ExecuteAlways]
 public class GridPositioningSystem : MonoBehaviour
 {
     // Одиночка (Singleton) для легкого доступа из других скриптов (например, из менеджера строительства)
@@ -20,21 +26,64 @@ public class GridPositioningSystem : MonoBehaviour
 
     private GameObject gridLinesContainer;
 
-    // Словарь занятых ячеек. Хранит координаты и ссылку на объект, который её занимает
+    // Словарь занятых ячеек. Хранит координаты и ссылку на объект, который её занимает.
+    // Заполняется ТОЛЬКО в play mode (через RegisterCounterAtCurrentPosition).
+    // В редакторе пуст — Editor-скрипт снапа не проверяет занятость, чтобы не блокировать
+    // расстановку объектов дизайнером (например, временное перекрытие при перемещении).
     private Dictionary<Vector2Int, BaseCounter> occupiedCells = new Dictionary<Vector2Int, BaseCounter>();
+
+    /// <summary>Размер ячейки сетки в метрах. Нужен Editor-скрипту для отрисовки превью.</summary>
+    public float GetCellSize() => cellSize;
+
+    /// <summary>Origin сетки в мировых координатах. Нужен Editor-скрипту.</summary>
+    public Vector3 GetGridOrigin() => gridOrigin;
+
+    /// <summary>Размеры сетки (X, Z). Нужны Editor-скрипту для ограничения зоны расстановки.</summary>
+    public Vector2Int GetGridBounds() => gridBounds;
 
     private void Awake()
     {
+        // В редакторе (edit mode) тоже устанавливаем Instance — это позволяет Editor-скриптам
+        // обращаться к GridPositioningSystem.Instance.GetGridPosition(...) и т.п.
+        // НЕ делаем Destroy(gameObject) при дублировании в редакторе — иначе при копировании
+        // сцены или undo/redo будут теряться объекты.
         if (Instance == null)
         {
             Instance = this;
         }
-        else
+        else if (Application.isPlaying)
         {
             Destroy(gameObject);
+            return;
         }
 
-        BuildGridVisualization();
+        // BuildGridVisualization создаёт дочерние GameObject с LineRenderer.
+        // В редакторе это даст лишний мусор в сцене при каждом Awake, поэтому
+        // визуализацию строим ТОЛЬКО в play mode. В edit mode сетку рисует OnDrawGizmos.
+        if (Application.isPlaying)
+        {
+            BuildGridVisualization();
+        }
+    }
+
+    private void OnEnable()
+    {
+        // Поддержка undo/redo и перезагрузки домена: при включении объекта в редакторе
+        // тоже обновляем Instance, если он пуст или указывает на уничтоженный объект.
+        if (Instance == null || (Instance != this && !Application.isPlaying))
+        {
+            Instance = this;
+        }
+    }
+
+    private void OnDestroy()
+    {
+        // В редакторе НЕ очищаем Instance при OnDestroy — иначе undo/redo сломают
+        // доступ к сетке из Editor-скрипта. В play mode — очищаем как обычно.
+        if (Application.isPlaying && Instance == this)
+        {
+            Instance = null;
+        }
     }
 
     private void Update()

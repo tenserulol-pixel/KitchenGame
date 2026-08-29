@@ -65,6 +65,34 @@ public class GameLoopManager : MonoBehaviour
 
         // Начинаем игру с фазы подготовки первого дня
         state = State.DayPreparation;
+
+        // Если есть сохранение — применяем его (currentDay, totalGold, owned upgrades).
+        // SaveManager к этому моменту уже создан в BootScene и пережил загрузку GameScene,
+        // потому что DontDestroyOnLoad. Если SaveManager ещё не успел инициализироваться
+        // (что маловероятно, т.к. BootStrapper инстанциирует его до загрузки GameScene),
+        // мы просто начнём новую игру с 1-го дня.
+        LoadProgressFromSaveIfAvailable();
+    }
+
+    /// <summary>
+    /// Если у SaveManager есть сохранение — восстанавливает из него currentDay и totalGold.
+    /// Owned upgrades пока не восстанавливаются (UpgradeManager ещё не имеет публичного
+    /// API для этого — добавим в шаге 5, когда будем полностью подключать сохранения).
+    /// </summary>
+    private void LoadProgressFromSaveIfAvailable()
+    {
+        if (SaveManager.Instance == null || !SaveManager.Instance.HasSave())
+        {
+            return;
+        }
+
+        GameSaveData save = SaveManager.Instance.GetCurrentSave();
+        if (save == null) return;
+
+        currentDay = save.currentDay;
+        totalGold = save.totalGold;
+
+        Debug.Log($"[GameLoop] Загружено сохранение: день {currentDay}, золота {totalGold}.");
     }
 
     private void Start()
@@ -105,18 +133,29 @@ public class GameLoopManager : MonoBehaviour
                 break;
 
             case State.DayResults:
-                // На экране итогов дня игрок нажимает Пробел или Enter, чтобы перейти к подготовке следующего дня
+                // На экране итогов дня игрок нажимает Пробел или Enter, чтобы перейти к подготовке следующего дня.
+                // Escape — выход в главное меню с сохранением текущего прогресса (toContinue в следующий раз).
                 if (Input.GetKeyDown(KeyCode.Space) || Input.GetKeyDown(KeyCode.Return))
                 {
                     StartNextDayPreparation();
                 }
+                else if (Input.GetKeyDown(KeyCode.Escape))
+                {
+                    QuitToMainMenu(saveProgress: true);
+                }
                 break;
 
             case State.GameOver:
-                // Окончательный конец игры (если нужно перезагрузить весь прогресс с 1-го дня)
+                // Окончательный конец игры: R — перезагрузка с 1-го дня, Escape — выход в меню.
+                // При поражении сохранение уже очищено в TriggerGameOver, так что в меню
+                // кнопка "Продолжить" будет неактивна.
                 if (Input.GetKeyDown(KeyCode.R))
                 {
                     RestartEntireGame();
+                }
+                else if (Input.GetKeyDown(KeyCode.Escape))
+                {
+                    QuitToMainMenu(saveProgress: false);
                 }
                 break;
         }
@@ -140,17 +179,53 @@ public class GameLoopManager : MonoBehaviour
     private void FinishActiveDay()
     {
         state = State.DayResults;
-        
+
         // Добавляем чистую дневную прибыль в общий кошелек игрока
         int netProfit = goldEarnedToday - goldLostToday;
         totalGold = Mathf.Max(0, totalGold + netProfit);
 
+        // Сохраняем прогресс в SaveManager — на случай, если игрок закроет игру
+        // прямо здесь, на экране результатов, не переходя на следующий день.
+        // Без этого SaveManager.HasSave() возвращал бы true при следующем запуске,
+        // но текущий день был бы устаревшим (старое значение до завершения).
+        SaveCurrentProgress();
+
         OnStateChanged?.Invoke(this, EventArgs.Empty);
-        
+
         Debug.Log($"[GameLoop] День {currentDay} завершен! Статистика: " +
                   $"Успешно: {successfulDeliveriesToday} (Заработано: {goldEarnedToday}g), " +
                   $"Провалено: {failedDeliveriesToday} (Штрафы: {goldLostToday}g). " +
                   $"Текущий общий баланс: {totalGold}g.");
+    }
+
+    /// <summary>
+    /// Сохраняет текущее состояние игры через SaveManager. Вызывается:
+    /// - после завершения дня (FinishActiveDay)
+    /// - при выходе в главное меню через QuitToMainMenu(saveProgress: true)
+    /// - (в будущем) при покупке/продаже стола, взятии карты апгрейда и т.п.
+    /// </summary>
+    public void SaveCurrentProgress()
+    {
+        if (SaveManager.Instance == null)
+        {
+            // SaveManager мог не инициализироваться только в редакторе при запуске
+            // GameScene напрямую, минуя BootScene. В билде этого не бывает.
+            return;
+        }
+
+        var data = new GameSaveData
+        {
+            currentDay = currentDay,
+            totalGold = totalGold,
+            // ownedUpgradeCardNames и placedObjects заполним в шаге 5, когда
+            // UpgradeManager получит публичный GetOwnedCardNames(), а ShopManager —
+            // метод CollectPlacedObjectsForSave(). Сейчас список останется пустым,
+            // что приемлемо для базового цикла игры.
+            ownedUpgradeCardNames = new System.Collections.Generic.List<string>(),
+            placedObjects = new System.Collections.Generic.List<PlacedObjectSaveData>()
+        };
+
+        SaveManager.Instance.Save(data);
     }
 
     /// <summary>
@@ -233,6 +308,14 @@ public class GameLoopManager : MonoBehaviour
         state = State.GameOver;
         OnStateChanged?.Invoke(this, EventArgs.Empty);
 
+        // При поражении очищаем сохранение — игрок не должен иметь возможность
+        // "Продолжить" после проигрыша. Иначе он бы перезагружался прямо перед
+        // тем моментом, который его и убил, и попадал в бесконечный цикл game over.
+        if (SaveManager.Instance != null)
+        {
+            SaveManager.Instance.ClearSave();
+        }
+
         Debug.Log($"[GameLoop] День {currentDay}: недовольных клиентов за смену — {failedDeliveriesToday}. Игра окончена.");
     }
 
@@ -298,12 +381,44 @@ public class GameLoopManager : MonoBehaviour
     public int GetFailedDeliveriesToday() => failedDeliveriesToday;
 
     /// <summary>
-    /// Полный сброс игры при поражении.
+    /// Полный сброс игры при поражении. Переводит в главное меню (а не перезагружает
+    /// текущую сцену, как раньше) — теперь у нас есть SceneLoader и MainMenuScene,
+    /// и при следующем запуске "Новой игры" из меню прогресс начнётся с чистого листа.
+    /// Сохранение уже очищено в TriggerGameOver, так что SaveManager.HasSave() вернёт false.
     /// </summary>
     private void RestartEntireGame()
     {
-        UnityEngine.SceneManagement.SceneManager.LoadScene(
-            UnityEngine.SceneManagement.SceneManager.GetActiveScene().buildIndex
-        );
+        QuitToMainMenu(saveProgress: false);
+    }
+
+    /// <summary>
+    /// Переход в главное меню. Может вызываться:
+    /// - из DayResults при нажатии Escape (с сохранением прогресса)
+    /// - из GameOver при нажатии R или Escape (без сохранения — оно уже очищено)
+    /// - из UI кнопки "Выйти в меню" на экране результатов (с сохранением)
+    /// - из RestartEntireGame (без сохранения)
+    ///
+    /// saveProgress: true — вызвать SaveCurrentProgress() перед выходом.
+    ///               false — не сохранять (например, при поражении, когда уже очищено).
+    /// </summary>
+    public void QuitToMainMenu(bool saveProgress)
+    {
+        if (saveProgress)
+        {
+            SaveCurrentProgress();
+        }
+
+        if (SceneLoader.Instance != null)
+        {
+            SceneLoader.Instance.LoadMainMenu(showLoadingScreen: true);
+        }
+        else
+        {
+            // Запасной вариант для случая, когда SceneLoader не инициализирован
+            // (например, при запуске GameScene напрямую в редакторе минуя BootScene).
+            // В билде этого не бывает — BootStrapper гарантирует создание SceneLoader.
+            Debug.LogWarning("[GameLoopManager] SceneLoader не найден, использую прямой SceneManager.");
+            UnityEngine.SceneManagement.SceneManager.LoadScene("MainMenuScene");
+        }
     }
 }

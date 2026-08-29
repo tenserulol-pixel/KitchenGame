@@ -36,9 +36,13 @@ public class GameUIManager : MonoBehaviour
     [SerializeField] private TextMeshProUGUI totalGoldResultsText;
     [SerializeField] private TextMeshProUGUI successfulDeliveriesText;
     [SerializeField] private TextMeshProUGUI failedDeliveriesText;
+    [Tooltip("Кнопка выхода в главное меню с экрана результатов дня. Может быть null — тогда работает только Escape.")]
+    [SerializeField] private UnityEngine.UI.Button quitToMenuButton;
 
     [Header("Элементы панели поражения (Game Over)")]
     [SerializeField] private TextMeshProUGUI gameOverReasonText;
+    [Tooltip("Кнопка выхода в главное меню с экрана Game Over. Может быть null — тогда работает только Escape/R.")]
+    [SerializeField] private UnityEngine.UI.Button gameOverQuitButton;
 
     private int lastDisplayedCountdownValue = -1;
     private Coroutine countdownPunchCoroutine;
@@ -52,6 +56,29 @@ public class GameUIManager : MonoBehaviour
             GameLoopManager.Instance.OnCountdownTimerChanged += GameLoopManager_OnCountdownTimerChanged;
             GameLoopManager.Instance.OnGoldChanged += GameLoopManager_OnGoldChanged;
             GameLoopManager.Instance.OnDayChanged += GameLoopManager_OnDayChanged;
+        }
+
+        // Кнопки выхода в меню. На Results — с сохранением прогресса, на GameOver —
+        // без (там уже всё очищено в GameLoopManager.TriggerGameOver).
+        if (quitToMenuButton != null)
+        {
+            quitToMenuButton.onClick.AddListener(() =>
+            {
+                if (GameLoopManager.Instance != null)
+                {
+                    GameLoopManager.Instance.QuitToMainMenu(saveProgress: true);
+                }
+            });
+        }
+        if (gameOverQuitButton != null)
+        {
+            gameOverQuitButton.onClick.AddListener(() =>
+            {
+                if (GameLoopManager.Instance != null)
+                {
+                    GameLoopManager.Instance.QuitToMainMenu(saveProgress: false);
+                }
+            });
         }
 
         // Первоначальное обновление интерфейса при старте сцены
@@ -70,6 +97,11 @@ public class GameUIManager : MonoBehaviour
             GameLoopManager.Instance.OnGoldChanged -= GameLoopManager_OnGoldChanged;
             GameLoopManager.Instance.OnDayChanged -= GameLoopManager_OnDayChanged;
         }
+
+        // removeAllListeners не нужен — при уничтожении объекта Unity сама отвязывает
+        // его onClick, но явная отписка хорошая практика, особенно для лямбд.
+        if (quitToMenuButton != null) quitToMenuButton.onClick.RemoveAllListeners();
+        if (gameOverQuitButton != null) gameOverQuitButton.onClick.RemoveAllListeners();
     }
 
     private void Update()
