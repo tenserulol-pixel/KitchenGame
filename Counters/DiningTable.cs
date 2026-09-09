@@ -36,6 +36,11 @@ public class DiningTable : BaseCounter
     private int finishedEatingCountCached = 0; // Сколько гостей реально поели (для точного количества посуды)
     private int dirtyPlatesCount = 0; // Сколько грязных тарелок сейчас физически находится на столе
 
+    [Header("NavMesh (обход стола клиентами)")]
+    [Tooltip("NavMeshObstacle на столе. Если назначен — клиенты будут обходить стол при" +
+             " пути к другим столам. Carve=true обязателен, иначе дыра в NavMesh не вырежется.")]
+    [SerializeField] private UnityEngine.AI.NavMeshObstacle navMeshObstacle;
+
     protected override void Awake()
     {
         // ВАЖНО: раньше здесь был "private void Awake()" без base.Awake() —
@@ -61,6 +66,69 @@ public class DiningTable : BaseCounter
                 }
             }
         }
+
+        // Регистрируемся в CustomerManager — спавнер клиентов должен знать про этот стол,
+        // чтобы направлять к нему группы. RequestRegisterTable — статический метод,
+        // он безопасен, даже если CustomerManager ещё не создан (порядок Awake в Unity
+        // не гарантирован): в этом случае стол складывается в pendingRegistrations и
+        // применяется в CustomerManager.Awake.
+        //
+        // Замена старого FindObjectsOfType<DiningTable>() в CustomerManager.Awake:
+        // теперь купленные через магазин столы (шаг 3.2) тоже автоматически попадают
+        // в список — Instantiate вызывает их Awake, и RegisterTable срабатывает.
+        CustomerManager.RequestRegisterTable(this);
+
+        // Активируем NavMeshObstacle — стол должен вырезать дыру в NavMesh, чтобы клиенты
+        // его обходили. Если obstacle не назначен в инспекторе — логируем предупреждение,
+        // но не падаем (игра работает, просто клиенты могут проходить сквозь стол).
+        if (navMeshObstacle != null)
+        {
+            navMeshObstacle.carving = true;
+            navMeshObstacle.enabled = true;
+        }
+        else
+        {
+            Debug.LogWarning($"[DiningTable] '{name}': NavMeshObstacle не назначен. " +
+                             "Клиенты могут проходить сквозь стол. Добавьте компонент NavMeshObstacle и назначьте его в поле navMeshObstacle.");
+        }
+    }
+
+    /// <summary>
+    /// Временно отключает NavMeshObstacle — вызывается FurnitureMovingController'ом
+    /// перед началом переноса стола. Без этого carving "тянет" за собой дыру в NavMesh,
+    /// которая не успевает перестроиться, и клиенты путаются в путях.
+    /// </summary>
+    public void DisableNavMeshObstacle()
+    {
+        if (navMeshObstacle != null)
+        {
+            navMeshObstacle.enabled = false;
+        }
+    }
+
+    /// <summary>
+    /// Включает NavMeshObstacle обратно — вызывается FurnitureMovingController'ом
+    /// после успешного размещения стола на новой ячейке. NavMesh перестраивается под
+    /// новой позицией, и клиенты снова обходят стол.
+    /// </summary>
+    public void EnableNavMeshObstacle()
+    {
+        if (navMeshObstacle != null)
+        {
+            navMeshObstacle.enabled = true;
+        }
+    }
+
+    protected override void OnDestroy()
+    {
+        // Обязательно base.OnDestroy() — снимает стол с учёта в GridPositioningSystem,
+        // иначе ячейка навсегда остаётся "занятой", и на неё ничего нельзя поставить.
+        base.OnDestroy();
+
+        // Снимаемся с учёта в CustomerManager — иначе спавнер мог бы вернуть этот стол
+        // из FindAvailableTable как null-ссылку (после Destroy), и OccupyTable упал бы
+        // с NRE. RequestUnregisterTable — статический, безопасен при Instance==null.
+        CustomerManager.RequestUnregisterTable(this);
     }
 
     public bool HasFreeChair()
@@ -329,6 +397,13 @@ public class DiningTable : BaseCounter
         ClearDirtyPlatesVisuals();
 
         SetFree();
+
+        // Стал свободным — подаём сигнал CustomerManager, чтобы он попытался посадить
+        // кого-нибудь из очереди. Если очереди нет — метод просто выйдет без действия.
+        if (CustomerManager.Instance != null)
+        {
+            CustomerManager.Instance.NotifyTableBecameAvailable();
+        }
     }
 
     public bool IsDirty() => tableState == TableState.Dirty;

@@ -17,8 +17,8 @@ public enum UpgradeEffectType
     BonusGold,            // Задаток покровителя — разовая прибавка золота при взятии карты
     SlowerQuotaGrowth,    // Щедрый день — снижает прирост дневной нормы групп
     DarkDeal,             // Тёмная сделка — цена рецептов выше (value), терпимость ниже (secondaryValue)
-    BiggerRarerGroups,    // Крупные компании — размер группы больше (value), но дневная норма меньше (secondaryValue)
-    RushHour,             // Час пик — интервал спавна короче (value), но лимит клиентов в зале ниже (secondaryValue)
+    BiggerRarerGroups,    // Большие компании — baseMaxGroupSize+ (value), baseDailyGroupTarget- (secondaryValue)
+    RushHour,             // Час пик — baseSpawnInterval- (value), baseMaxCustomers- (secondaryValue)
 }
 
 [CreateAssetMenu]
