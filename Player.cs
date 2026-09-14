@@ -110,6 +110,11 @@ public class Player : MonoBehaviour, IKitchenObjectParent
             {
                 puddle.SetCleaningState(isHeld);
             }
+            // Для котла (перемешивание зажатием F)
+            else if (selectedCounter is StoveCounter stoveCounter)
+            {
+                stoveCounter.SetStirringState(isHeld);
+            }
             // Для других столов, поддерживающих удержание, добавляйте аналогично
         }
     }

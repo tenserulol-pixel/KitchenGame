@@ -3,7 +3,7 @@ using UnityEngine.AI;
 using System;
 
 [RequireComponent(typeof(NavMeshAgent))]
-public class CustomerAI : MonoBehaviour
+public class CustomerAI : MonoBehaviour, IHasProgress
 {
     public enum CustomerState
     {
@@ -18,6 +18,21 @@ public class CustomerAI : MonoBehaviour
     }
 
     public event EventHandler OnStateChanged;
+
+    // === IHasProgress: прогресс-бар терпения ===
+    // Стреляет при изменении терпения — как обычного (patienceTimer / maxPatience),
+    // так и очередного (queuePatienceTimer / maxQueuePatience).
+    //
+    // Один прогресс-бар используется для обоих случаев:
+    // - В состоянии WaitingForFood: progressNormalized = patienceTimer / maxPatience
+    // - В состоянии Queueing:       progressNormalized = queuePatienceTimer / maxQueuePatience
+    // - В остальных состояниях:     progressNormalized = 0f (бар скрыт)
+    //
+    // ProgressBarUI подписывается на OnProgressChanged и обновляет fillAmount.
+    // При 0f или 1f ProgressBarUI скрывает себя — но мы хотим, чтобы при полном
+    // терпении (1f) бар был ВИДЕН. Поэтому в SitDown() стреляем 1f, а ProgressBarUI
+    // нужно поправить так, чтобы скрывался только при 0f (см. инструкцию ниже).
+    public event EventHandler<IHasProgress.OnProgressChangedEventArgs> OnProgressChanged;
 
     [Header("Настройки времени")]
     [SerializeField] private float eatingTime = 10f;
@@ -117,6 +132,14 @@ public class CustomerAI : MonoBehaviour
     {
         patienceTimer -= Time.deltaTime;
 
+        // Уведомляем прогресс-бар: 1.0 = полное терпение, 0.0 = кончилось.
+        // Защита от деления на 0, если maxPatience = 0 (нечаянно в инспекторе).
+        float normalized = maxPatience > 0f ? Mathf.Clamp01(patienceTimer / maxPatience) : 0f;
+        OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs
+        {
+            progressNormalized = normalized
+        });
+
         if (patienceTimer <= 0)
         {
             LeaveTableAngry();
@@ -203,12 +226,28 @@ public class CustomerAI : MonoBehaviour
         {
             queuePatienceTimer = maxQueuePatience;
             SetState(CustomerState.Queueing);
+
+            // Сразу показываем бар полным — клиент только встал в очередь.
+            // Без этого бара не будет до первого кадра UpdateQueueing, что выглядит как "пустота".
+            float normalized = maxQueuePatience > 0f ? 1f : 0f;
+            OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs
+            {
+                progressNormalized = normalized
+            });
         }
     }
 
     private void UpdateQueueing()
     {
         queuePatienceTimer -= Time.deltaTime;
+
+        // Уведомляем прогресс-бар: 1.0 = полное терпение в очереди, 0.0 = кончилось.
+        // Тот же прогресс-бар, что и для WaitingForFood — игрок видит одинаковую индикацию.
+        float normalized = maxQueuePatience > 0f ? Mathf.Clamp01(queuePatienceTimer / maxQueuePatience) : 0f;
+        OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs
+        {
+            progressNormalized = normalized
+        });
 
         if (queuePatienceTimer <= 0f)
         {
@@ -293,6 +332,13 @@ public class CustomerAI : MonoBehaviour
         }
 
         SetState(CustomerState.WaitingForFood);
+
+        // Показываем прогресс-бар терпения сразу полным (1.0) — клиент сел, бар появился.
+        // Без этого бара не будет до первого кадра UpdateWaiting, что выглядит как "пустота".
+        OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs
+        {
+            progressNormalized = 1f
+        });
     }
 
     private void SelectRecipe()
@@ -408,6 +454,18 @@ public class CustomerAI : MonoBehaviour
     {
         state = newState;
         OnStateChanged?.Invoke(this, EventArgs.Empty);
+
+        // Скрываем прогресс-бар терпения во всех состояниях, где он не нужен:
+        // Walking / Sitting / Eating / FinishedEating / Leaving / WalkingToQueue.
+        // Бар виден только в WaitingForFood и Queueing (там события стреляют из Update).
+        // ProgressBarUI скрывает себя при progressNormalized == 0f.
+        if (newState != CustomerState.WaitingForFood && newState != CustomerState.Queueing)
+        {
+            OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs
+            {
+                progressNormalized = 0f
+            });
+        }
     }
 
     public CustomerState GetState() => state;
