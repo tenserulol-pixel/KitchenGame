@@ -29,12 +29,26 @@ public class DiningTable : BaseCounter
     // Списки для отслеживания группы клиентов за столом
     private readonly List<CustomerAI> currentCustomers = new List<CustomerAI>();
     private readonly List<CustomerAI> finishedEatingCustomers = new List<CustomerAI>();
-    
+
     // Список для хранения ссылок на заспавненные визуальные тарелки на столе
     private readonly List<GameObject> dirtyPlateVisualGameObjectList = new List<GameObject>();
 
     private int finishedEatingCountCached = 0; // Сколько гостей реально поели (для точного количества посуды)
     private int dirtyPlatesCount = 0; // Сколько грязных тарелок сейчас физически находится на столе
+
+    // === КАРТЫ АПГРЕЙДОВ ===
+    // «Общий заказ» (SameDishChance) и «Большие порции» (BigPortions) опрашиваются
+    // на ходу через DeliveryManager.HasUpgrade() — ничего не нужно включать/выключать
+    // при взятии карты, эффект читает актуальное состояние UpgradeManager.
+    //
+    // Сколько гостей группы ещё НЕ село на стулья. Заполняется в OccupyTable,
+    // уменьшается в CustomerSeated. Когда достигает нуля — вся группа на месте,
+    // и можно добавлять доп. блюдо от «Больших порций».
+    private int pendingSeatCount = 0;
+    // Доп. порции уже зарегистрированы для текущей группы (защита от повтора)
+    private bool extraPortionsRegistered = false;
+    // Невыданные доп. блюда группы (рецепты совпадают с заказами сидящих гостей)
+    private readonly List<RecipeSO> extraPortionOrders = new List<RecipeSO>();
 
     [Header("NavMesh (обход стола клиентами)")]
     [Tooltip("NavMeshObstacle на столе. Если назначен — клиенты будут обходить стол при" +
@@ -177,6 +191,13 @@ public class DiningTable : BaseCounter
         finishedEatingCustomers.Clear();
         finishedEatingCountCached = 0;
 
+        // КАРТЫ: сброс состояния группы. pendingSeatCount = размер группы —
+        // когда каждый гость сядет (CustomerSeated), счётчик дойдёт до нуля
+        // и сработает TryRegisterExtraPortions для «Больших порций».
+        pendingSeatCount = customers.Count;
+        extraPortionsRegistered = false;
+        extraPortionOrders.Clear();
+
         currentCustomers.AddRange(customers);
         SetOccupied();
 
@@ -188,11 +209,104 @@ public class DiningTable : BaseCounter
 
     public void CustomerSeated(CustomerAI customer)
     {
+        if (customer == null) return;
+
+        // === КАРТА «Общий заказ» ===
+        // С вероятностью value (0..1) гость берёт то же блюдо, что и первый севший
+        // за этот стол. Меняем заказ ДО добавления гостя в список и ДО того, как
+        // CustomerAI.SitDown покажет пузырь заказа и зарегистрирует его в
+        // DeliveryManager — визуал и список заказов получат уже согласованный рецепт.
+        // Синергия с «Большие порции»: зеркальная группа + доп. блюдо, скопированное
+        // с заказов гостей = серия одинаковых блюд за один прогон по кухне.
+        if (currentCustomers.Count > 0
+            && DeliveryManager.HasUpgrade(UpgradeEffectType.SameDishChance))
+        {
+            float mirrorChance = DeliveryManager.GetUpgradeValue(UpgradeEffectType.SameDishChance);
+            if (UnityEngine.Random.value < mirrorChance)
+            {
+                customer.MirrorOrderFrom(currentCustomers[0]);
+            }
+        }
+
         if (!currentCustomers.Contains(customer))
         {
             currentCustomers.Add(customer);
         }
         SetOccupied();
+
+        // === КАРТА «Большие порции»: отслеживание посадки группы ===
+        pendingSeatCount = Mathf.Max(0, pendingSeatCount - 1);
+        if (pendingSeatCount == 0)
+        {
+            TryRegisterExtraPortions();
+        }
+    }
+
+    /// <summary>
+    /// Вся группа села — регистрируем доп. блюда от карты «Большие порции».
+    /// Рецепт доп. блюда = заказ случайного уже сидящего гостя: игрок всегда может
+    /// его приготовить (этот рецепт кто-то уже заказал) и видно его в списке заказов.
+    /// Доп. блюдо НЕ имеет своего едока — при подаче просто потребляется в TryServe.
+    /// </summary>
+    private void TryRegisterExtraPortions()
+    {
+        if (extraPortionsRegistered) return;
+        extraPortionsRegistered = true;
+
+        if (!DeliveryManager.HasUpgrade(UpgradeEffectType.BigPortions)) return;
+        if (DeliveryManager.Instance == null) return;
+
+        int extraCount = Mathf.Max(0, Mathf.RoundToInt(DeliveryManager.GetUpgradeValue(UpgradeEffectType.BigPortions)));
+        if (extraCount == 0) return;
+
+        // Собираем заказы всех севших гостей
+        List<RecipeSO> seatedOrders = new List<RecipeSO>();
+        foreach (CustomerAI seated in currentCustomers)
+        {
+            if (seated != null && seated.GetOrderedRecipe() != null)
+            {
+                seatedOrders.Add(seated.GetOrderedRecipe());
+            }
+        }
+
+        if (seatedOrders.Count == 0)
+        {
+            Debug.LogWarning($"[DiningTable] '{name}': «Большие порции» не сработали — у севших гостей нет заказов (пустой recipeListSO?).");
+            return;
+        }
+
+        string extraNames = "";
+        for (int i = 0; i < extraCount; i++)
+        {
+            RecipeSO extraRecipe = seatedOrders[UnityEngine.Random.Range(0, seatedOrders.Count)];
+            extraPortionOrders.Add(extraRecipe);
+            DeliveryManager.Instance.AddOrderFromTable(extraRecipe, this);
+            extraNames += (i > 0 ? ", " : "") + extraRecipe.RecipeName;
+        }
+
+        Debug.Log($"[DiningTable] «Большие порции»: столу '{name}' требуется ещё {extraCount} блюдо(а): {extraNames}.");
+    }
+
+    /// <summary>
+    /// Группа ушла (полностью) — снимаем недоставленные доп. блюда «Больших порций»,
+    /// чтобы по столу не висели заказы-призраки без едоков.
+    /// </summary>
+    private void CancelExtraPortions()
+    {
+        if (extraPortionOrders.Count == 0) return;
+
+        int cancelled = extraPortionOrders.Count;
+        extraPortionOrders.Clear();
+
+        if (DeliveryManager.Instance != null)
+        {
+            for (int i = 0; i < cancelled; i++)
+            {
+                DeliveryManager.Instance.RemoveOrderFromTable(this);
+            }
+        }
+
+        Debug.Log($"[DiningTable] «Большие порции»: группа ушла, не доев {cancelled} доп. блюдо(а) — заказы сняты.");
     }
 
     public void OnCustomerLeft(CustomerAI customer)
@@ -211,11 +325,15 @@ public class DiningTable : BaseCounter
 
         if (currentCustomers.Count == 0)
         {
+            // КАРТЫ: сначала снимаем недоставленные доп. блюда — до переключения состояния
+            CancelExtraPortions();
+
             // Если хотя бы один клиент за столом успел покушать — стол становится грязным
             if (finishedEatingCountCached > 0)
             {
                 SetDirty();
                 // Спавним стопку грязных тарелок по количеству реально покушавших гостей
+                // (доп. порции «Больших порций» тоже оставляют грязную тарелку)
                 SpawnDirtyPlatesStack(finishedEatingCountCached);
                 finishedEatingCountCached = 0;
             }
@@ -235,7 +353,10 @@ public class DiningTable : BaseCounter
             finishedEatingCountCached++;
         }
 
-        // Если абсолютно все сидящие за столом гости закончили кушать
+        // Если абсолютно все сидящие за столом гости закончили кушать.
+        // ВАЖНО: доп. блюда «Больших порций» НЕ блокируют уход группы —
+        // если игрок не успел подать их до конца трапезы, заказы снимаются
+        // в CancelExtraPortions (упущенная выгода, но не софтлок).
         if (finishedEatingCustomers.Count >= currentCustomers.Count && currentCustomers.Count > 0)
         {
             List<CustomerAI> customersToLeave = new List<CustomerAI>(currentCustomers);
@@ -286,6 +407,20 @@ public class DiningTable : BaseCounter
                 return true;
             }
         }
+
+        // === КАРТА «Большие порции»: подача доп. блюда группы ===
+        // У доп. порции нет конкретного едока — считаем её поданной, если рецепт
+        // совпал с одним из невыданных доп. блюд. Каждая поданная доп. порция
+        // оставляет после себя грязную тарелку (finishedEatingCountCached++).
+        int extraIndex = extraPortionOrders.IndexOf(recipeSO);
+        if (extraIndex >= 0)
+        {
+            extraPortionOrders.RemoveAt(extraIndex);
+            finishedEatingCountCached++;
+            Debug.Log($"[DiningTable] «Большие порции»: доп. блюдо ({recipeSO.RecipeName}) подано на стол '{name}'. Осталось доп. блюд: {extraPortionOrders.Count}.");
+            return true;
+        }
+
         return false;
     }
 
@@ -308,26 +443,35 @@ public class DiningTable : BaseCounter
         // === СОСТОЯНИЕ 1: ЗА СТОЛОМ СИДЯТ КЛИЕНТЫ ===
         if (IsOccupied())
         {
-            // Если игрок принес еду на тарелке
-            if (player.HasKitchenObject())
+            if (!player.HasKitchenObject())
             {
-                if (player.GetKitchenObject().TryGetPlate(out PlateKitchenObject plateKitchenObject))
+                Debug.Log("[DiningTable] Руки пусты — нечего подавать за стол.");
+                return;
+            }
+
+            if (!player.GetKitchenObject().TryGetPlate(out PlateKitchenObject plateKitchenObject))
+            {
+                Debug.Log("[DiningTable] В руках не тарелка — подать заказ нельзя.");
+                return;
+            }
+
+            // Передаем проверку и доставку менеджеру доставки
+            if (DeliveryManager.Instance != null)
+            {
+                if (DeliveryManager.Instance.TryDeliverRecipeToTable(plateKitchenObject, this))
                 {
-                    // Передаем проверку и доставку менеджеру доставки
-                    if (DeliveryManager.Instance != null)
-                    {
-                        if (DeliveryManager.Instance.TryDeliverRecipeToTable(plateKitchenObject, this))
-                        {
-                            // Золото начисляется внутри DeliveryManager.TryDeliverRecipeToTable —
-                            // там же, где известна реальная стоимость рецепта (recipeSO.Cost).
-                            Debug.Log("Заказ успешно передан клиенту за столом!");
-                        }
-                        else
-                        {
-                            Debug.Log("Никто за этим столом не заказывал такое блюдо!");
-                        }
-                    }
+                    // Золото начисляется внутри DeliveryManager.TryDeliverRecipeToTable —
+                    // там же, где известна реальная стоимость рецепта (recipeSO.Cost).
+                    Debug.Log("Заказ успешно передан клиенту за столом!");
                 }
+                else
+                {
+                    Debug.Log("Никто за этим столом не заказывал такое блюдо!");
+                }
+            }
+            else
+            {
+                Debug.LogWarning("[DiningTable] DeliveryManager.Instance == null — подача невозможна!");
             }
             return;
         }
@@ -396,6 +540,12 @@ public class DiningTable : BaseCounter
         finishedEatingCountCached = 0;
         ClearDirtyPlatesVisuals();
 
+        // КАРТЫ: страховка — на чистом столе не должно оставаться доп. блюд
+        // (обычно они уже сняты в CancelExtraPortions; здесь это no-op)
+        extraPortionOrders.Clear();
+        extraPortionsRegistered = false;
+        pendingSeatCount = 0;
+
         SetFree();
 
         // Стал свободным — подаём сигнал CustomerManager, чтобы он попытался посадить
@@ -412,6 +562,9 @@ public class DiningTable : BaseCounter
     public int GetCustomerCount() => currentCustomers.Count;
     public List<CustomerAI> GetCustomers() => currentCustomers;
     public Chair[] GetChairs() => chairs;
+
+    /// <summary>Сколько доп. блюд «Больших порций» ещё не подано на этот стол.</summary>
+    public int GetExtraPortionsRemaining() => extraPortionOrders.Count;
 
     /// <summary>
     /// Ищет ближайший к указанной позиции СВОБОДНЫЙ (на месте) стул, ничего не меняя.

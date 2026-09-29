@@ -9,13 +9,17 @@ using System.Collections.Generic;
 /// 1) Игрок кладёт ингредиенты через E (по одному за раз). Каждый ингредиент добавляется в список currentIngredients.
 /// 2) Когда текущий список совпадает с inputs какого-то рецепта → переходим в ReadyToStir.
 /// 3) Игрок зажимает F (InteractAlternate) — SetStirringState(true) вызывается из Player.Update().
-///    Состояние Stirring, прогресс stirring растёт.
-/// 4) При достижении stirringRequired → выходим в Done, спавним выходное блюдо поверх ингредиентов.
-/// 5) Если игрок отпустил F — прогресс сохраняется, состояние ReadyToStir (можно продолжить).
-/// 6) Если у рецепта есть burningTimerMax > 0, и игрок не забрал блюдо за это время — Burned.
+///    Состояние Stirring, прогресс stirring растёт (умножается на «Быстрый огонь»).
+/// 4) При достижении stirringRequired:
+///    - если pendingExtraStirs > 0 (карта «Нестабильный котёл») — цикл перемешивания повторяется;
+///    - иначе → Brewing: автоматическая варка (тоже ускоряется «Быстрым огнём»),
+///      по завершении — Done, спавним выходное блюдо.
+/// 5) Если игрок отпустил F — прогресс сохраняется, можно продолжить.
+/// 6) Если у рецепта есть burningTimerMax > 0, и игрок не забрал блюдо за это время — Burned
+///    (таймер сжигания умножается на burnRateMultiplier от «Быстрого огня»).
 ///
 /// Поддержка нескольких ингредиентов:
-/// - Сравнение списков через HashSet (неупорядоченное сравнение, чтобы [Грибы, Коренья] == [Коренья, Грибы]).
+/// - Сравнение списков неупорядоченное, с учётом кратности ([Грибы, Коренья] == [Коренья, Грибы]).
 /// - Сначала проверяем рецепты с БОЛЬШИМ количеством inputs (приоритет сложным рецептам над простыми).
 /// </summary>
 public class StoveCounter : BaseCounter, IHasProgress
@@ -55,6 +59,35 @@ public class StoveCounter : BaseCounter, IHasProgress
 
     private bool isPlayerStirring = false;
 
+    // Нестабильный котёл: сколько доп. перемешиваний осталось до варки (берётся
+    // из UpgradeManager при подборе рецепта в котёл).
+    private int pendingExtraStirs = 0;
+
+    // === Реестр котельных блюд (общий для всех StoveCounter) ===
+    // Заполняется в Awake из brewingRecipeSOarray. DeliveryManager по нему отличает
+    // блюда, сваренные в котле (им применяется множитель цены Нестабильного котла),
+    // от собранных руками на тарелке.
+    private static readonly HashSet<KitchenObjectSO> cauldronOutputs = new HashSet<KitchenObjectSO>();
+
+    public static bool IsCauldronOutput(KitchenObjectSO kitchenObjectSO) =>
+        kitchenObjectSO != null && cauldronOutputs.Contains(kitchenObjectSO);
+
+    protected override void Awake()
+    {
+        base.Awake();
+
+        if (brewingRecipeSOarray != null)
+        {
+            foreach (FryingRecipeSO recipe in brewingRecipeSOarray)
+            {
+                if (recipe != null && recipe.output != null)
+                {
+                    cauldronOutputs.Add(recipe.output);
+                }
+            }
+        }
+    }
+
     private void Start()
     {
         state = State.Empty;
@@ -80,28 +113,41 @@ public class StoveCounter : BaseCounter, IHasProgress
                 break;
 
             case State.Stirring:
-                // Прогресс перемешивания растёт только если игрок держит F
+                // Прогресс перемешивания растёт только если игрок держит F.
+                // Быстрый огонь: скорость умножается на кулинарный множитель.
                 if (isPlayerStirring && activeRecipe != null)
                 {
-                    stirringProgress += Time.deltaTime;
+                    stirringProgress += Time.deltaTime * GetCookSpeed();
                     NotifyProgressChanged(stirringProgress / activeRecipe.stirringRequired);
 
                     if (stirringProgress >= activeRecipe.stirringRequired)
                     {
-                        // Перемешивание завершено — переходим к варке (если есть brewingTimerMax)
-                        // или сразу к готовому блюду (если brewingTimerMax == 0).
-                        StartBrewingOrComplete();
+                        if (pendingExtraStirs > 0)
+                        {
+                            // Нестабильный котёл: цикл завершён, но котёл требует ещё.
+                            pendingExtraStirs--;
+                            stirringProgress = 0f;
+                            NotifyProgressChanged(0f);
+                            Debug.Log($"[StoveCounter] Котёл бурлит неспокойно! Осталось перемешиваний: {pendingExtraStirs}.");
+                        }
+                        else
+                        {
+                            StartBrewingOrComplete();
+                        }
                     }
                 }
                 // Если отпустил — остаёмся в Stirring, прогресс сохраняется
                 break;
 
             case State.Brewing:
+                // ★ ФИКС: блок был случайно удалён при врезке FastFire — без него котёл
+                // навсегда зависал в состоянии Brewing (варка не тикала, блюдо не спавнилось).
+                //
                 // Автоматическая варка — прогресс растёт без участия игрока.
-                // Игрок может отойти и заниматься другими делами.
+                // Быстрый огонь: варка тоже умножается на кулинарный множитель.
                 if (activeRecipe != null && activeRecipe.brewingTimerMax > 0f)
                 {
-                    brewingTimer += Time.deltaTime;
+                    brewingTimer += Time.deltaTime * GetCookSpeed();
                     NotifyProgressChanged(brewingTimer / activeRecipe.brewingTimerMax);
 
                     if (brewingTimer >= activeRecipe.brewingTimerMax)
@@ -118,10 +164,11 @@ public class StoveCounter : BaseCounter, IHasProgress
                 break;
 
             case State.Done:
-                // Если у рецепта есть burningTimerMax — тикает таймер сжигания
+                // Если у рецепта есть burningTimerMax — тикает таймер сжигания.
+                // Быстрый огонь: блюдо горит быстрее (burnRateMultiplier).
                 if (burningRecipe != null && burningRecipe.burningTimerMax > 0f)
                 {
-                    burningTimer += Time.deltaTime;
+                    burningTimer += Time.deltaTime * GetBurnRate();
                     NotifyProgressChanged(burningTimer / burningRecipe.burningTimerMax);
 
                     if (burningTimer >= burningRecipe.burningTimerMax)
@@ -186,6 +233,9 @@ public class StoveCounter : BaseCounter, IHasProgress
                     activeRecipe = matchedRecipe;
                     state = State.ReadyToStir;
                     stirringProgress = 0f;
+                    pendingExtraStirs = UpgradeManager.Instance != null
+                        ? UpgradeManager.Instance.GetCauldronExtraStirs()
+                        : 0;
 
                     // Подготавливаем burning recipe для выходного блюда
                     burningRecipe = GetBurningRecipeSOWithInput(activeRecipe.output);
@@ -375,6 +425,7 @@ public class StoveCounter : BaseCounter, IHasProgress
         }
         else
         {
+            Debug.LogWarning("[StoveCounter] brewingTimerMax = 0 — этап варки пропущен, блюдо будет выдано сразу.");
             // Без этапа варки — сразу готово
             CompleteRecipe();
         }
@@ -385,7 +436,15 @@ public class StoveCounter : BaseCounter, IHasProgress
     /// </summary>
     private void CompleteRecipe()
     {
-        if (activeRecipe == null || activeRecipe.output == null) return;
+        // ★ ФИКС: раньше ранний выход был БЕЗ лога — котёл молча зависал,
+        // если у ассета FryingRecipeSO не заполнен output.
+        if (activeRecipe == null || activeRecipe.output == null)
+        {
+            Debug.LogError($"[StoveCounter] КОТЁЛ ЗАВИС: CompleteRecipe при activeRecipe={activeRecipe}, " +
+                           $"output={(activeRecipe != null && activeRecipe.output != null ? activeRecipe.output.objectName : "NULL")}. " +
+                           "Проверь ассет FryingRecipeSO: поля output и brewingTimerMax.");
+            return;
+        }
 
         // Спавним выходное блюдо как KitchenObject на counterTopPoint
         KitchenObject.SpawnKitchenObject(activeRecipe.output, this);
@@ -435,6 +494,7 @@ public class StoveCounter : BaseCounter, IHasProgress
         state = State.Empty;
         NotifyStateChanged();
         NotifyProgressChanged(0f);
+        pendingExtraStirs = 0;
     }
 
     private BurningRecipeSO GetBurningRecipeSOWithInput(KitchenObjectSO input)
@@ -466,4 +526,12 @@ public class StoveCounter : BaseCounter, IHasProgress
     }
 
     public State GetState() => state;
+
+    // Быстрый огонь: множитель скорости перемешивания/варки (1.0 = база)
+    private float GetCookSpeed() =>
+        UpgradeManager.Instance != null ? UpgradeManager.Instance.GetCookSpeedMultiplier() : 1f;
+
+    // Быстрый огонь: множитель скорости сгорания (1.0 = база)
+    private float GetBurnRate() =>
+        UpgradeManager.Instance != null ? UpgradeManager.Instance.GetBurnRateMultiplier() : 1f;
 }

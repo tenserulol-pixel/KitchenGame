@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEngine.AI;
 using System;
+using System.Collections.Generic;
 
 [RequireComponent(typeof(NavMeshAgent))]
 public class CustomerAI : MonoBehaviour, IHasProgress
@@ -24,14 +25,11 @@ public class CustomerAI : MonoBehaviour, IHasProgress
     // так и очередного (queuePatienceTimer / maxQueuePatience).
     //
     // Один прогресс-бар используется для обоих случаев:
-    // - В состоянии WaitingForFood: progressNormalized = patienceTimer / maxPatience
+    // - В состоянии WaitingForFood: progressNormalized = patienceTimer / (maxPatience * множитель)
     // - В состоянии Queueing:       progressNormalized = queuePatienceTimer / maxQueuePatience
     // - В остальных состояниях:     progressNormalized = 0f (бар скрыт)
     //
     // ProgressBarUI подписывается на OnProgressChanged и обновляет fillAmount.
-    // При 0f или 1f ProgressBarUI скрывает себя — но мы хотим, чтобы при полном
-    // терпении (1f) бар был ВИДЕН. Поэтому в SitDown() стреляем 1f, а ProgressBarUI
-    // нужно поправить так, чтобы скрывался только при 0f (см. инструкцию ниже).
     public event EventHandler<IHasProgress.OnProgressChangedEventArgs> OnProgressChanged;
 
     [Header("Настройки времени")]
@@ -132,9 +130,13 @@ public class CustomerAI : MonoBehaviour, IHasProgress
     {
         patienceTimer -= Time.deltaTime;
 
+        // КАРТА «Спешащие гости» (HurriedGuests): делим на ЭФФЕКТИВНОЕ терпение
+        // (maxPatience * множитель) — при множителе < 1 бар опустошается быстрее.
+        float effectiveMaxPatience = maxPatience * GetEffectivePatienceMultiplier();
+
         // Уведомляем прогресс-бар: 1.0 = полное терпение, 0.0 = кончилось.
         // Защита от деления на 0, если maxPatience = 0 (нечаянно в инспекторе).
-        float normalized = maxPatience > 0f ? Mathf.Clamp01(patienceTimer / maxPatience) : 0f;
+        float normalized = effectiveMaxPatience > 0f ? Mathf.Clamp01(patienceTimer / effectiveMaxPatience) : 0f;
         OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs
         {
             progressNormalized = normalized
@@ -159,6 +161,42 @@ public class CustomerAI : MonoBehaviour, IHasProgress
                 diningTable.OnCustomerFinishedEating(this);
             }
         }
+    }
+
+    // ======================================================================
+    // === КАРТЫ АПГРЕЙДОВ ===
+    // ======================================================================
+
+    /// <summary>
+    /// КАРТА «Спешащие гости» (HurriedGuests): эффективное терпение = maxPatience * множитель.
+    /// Множитель &lt; 1 — терпение тает быстрее (компенсация — +secondaryValue к выплате,
+    /// её начисляет DeliveryManager.CalculatePayout). Множитель читается из UpgradeManager
+    /// при каждом запросе: карту могут взять посреди дня, эффект подхватится без перезапуска.
+    /// </summary>
+    private float GetEffectivePatienceMultiplier()
+    {
+        if (UpgradeManager.Instance != null)
+        {
+            return Mathf.Max(0.1f, UpgradeManager.Instance.GetPatienceMultiplier());
+        }
+        return 1f;
+    }
+
+    /// <summary>
+    /// КАРТА «Общий заказ» (SameDishChance): вызывается из DiningTable.CustomerSeated.
+    /// Сосед (первый севший за стол) уже выбрал блюдо, а пузырь заказа (ShowOrder) и
+    /// регистрация в списке заказов (AddOrderFromTable) произойдут ПОЗЖЕ — см. порядок
+    /// вызовов в SitDown: SelectRecipe → CustomerSeated → ShowOrder → AddOrderFromTable.
+    /// Поэтому и пузырь, и список покажут уже скопированный рецепт.
+    /// </summary>
+    public void MirrorOrderFrom(CustomerAI source)
+    {
+        if (source == null) return;
+
+        RecipeSO sourceRecipe = source.GetOrderedRecipe();
+        if (sourceRecipe == null) return;
+
+        orderedRecipe = sourceRecipe;
     }
 
     /// <summary>
@@ -243,6 +281,7 @@ public class CustomerAI : MonoBehaviour, IHasProgress
 
         // Уведомляем прогресс-бар: 1.0 = полное терпение в очереди, 0.0 = кончилось.
         // Тот же прогресс-бар, что и для WaitingForFood — игрок видит одинаковую индикацию.
+        // ВАЖНО: терпение в очереди от «Спешащих гостей» НЕ зависит — карта про сидящих гостей.
         float normalized = maxQueuePatience > 0f ? Mathf.Clamp01(queuePatienceTimer / maxQueuePatience) : 0f;
         OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs
         {
@@ -319,7 +358,15 @@ public class CustomerAI : MonoBehaviour, IHasProgress
 
         SelectRecipe();
 
-        patienceTimer = maxPatience;
+        // ДИАГНОСТИКА: рецепт не выбрался — почти всегда пустой recipeListSO в инспекторе
+        // префаба клиента. Заказ не зарегистрируется и клиент не сможет поесть.
+        if (orderedRecipe == null)
+        {
+            Debug.LogWarning($"[CustomerAI] '{name}': SelectRecipe не выбрал рецепт — проверь recipeListSO у префаба клиента. Заказ не будет зарегистрирован!");
+        }
+
+        // КАРТА «Спешащие гости»: садимся с ЭФФЕКТИВНЫМ терпением (maxPatience * множитель)
+        patienceTimer = maxPatience * GetEffectivePatienceMultiplier();
 
         diningTable.CustomerSeated(this);
 
@@ -346,7 +393,17 @@ public class CustomerAI : MonoBehaviour, IHasProgress
         if (recipeListSO == null || recipeListSO.recipeSOList.Count == 0)
             return;
 
-        orderedRecipe = recipeListSO.recipeSOList[UnityEngine.Random.Range(0, recipeListSO.recipeSOList.Count)];
+        // КАРТА «Алхимический хаос» (AlchemyChaos): пополняем пул рецептов/ингредиентов
+        // для ежедневной мутации. Вызов при каждом заказе безопасен — дубли внутри
+        // отсекаются, а отложенный бросок дня (если пул был пуст) сработает здесь.
+        RecipeChaos.EnsurePool(recipeListSO.recipeSOList);
+
+        RecipeSO baseRecipe = recipeListSO.recipeSOList[UnityEngine.Random.Range(0, recipeListSO.recipeSOList.Count)];
+
+        // КАРТА «Алхимический хаос»: заказ прогоняется через мутацию дня.
+        // Если мутации сегодня нет (или этот рецепт не пострадал) — вернётся исходник.
+        // Ассет-оригинал никогда не меняется: пострадавший рецепт — это рантайм-клон.
+        orderedRecipe = RecipeChaos.ApplyDailyMutation(baseRecipe);
     }
 
     public bool TryDeliver(RecipeSO recipeSO)
@@ -381,7 +438,15 @@ public class CustomerAI : MonoBehaviour, IHasProgress
 
     private void ShowOrder()
     {
-        if (orderVisualPrefab == null || orderedRecipe == null)
+        if (orderVisualPrefab == null)
+        {
+            // ДИАГНОСТИКА: префаб пузыря заказа не назначен — заказ «невидимый» для игрока,
+            // при этом механика подачи работает. Проверь поле orderVisualPrefab у префаба.
+            Debug.LogWarning($"[CustomerAI] '{name}': orderVisualPrefab не назначен — пузырь заказа не появится!");
+            return;
+        }
+
+        if (orderedRecipe == null)
             return;
 
         orderVisualInstance = Instantiate(
@@ -406,7 +471,9 @@ public class CustomerAI : MonoBehaviour, IHasProgress
     {
         SetState(CustomerState.Leaving);
 
-        // Если уходим сердитыми (или по ошибке с недоеденной едой), удаляем заказ из системы
+        // Если уходим сердитыми (или по ошибке с недоеденной едой), удаляем заказ из системы.
+        // Для зеркальных заказов («Общий заказ») и мутаций («Алхимический хаос») снимается
+        // ровно та же ссылка, что была добавлена в AddOrderFromTable — по ссылкам сходится.
         if (DeliveryManager.Instance != null && orderedRecipe != null)
         {
             DeliveryManager.Instance.RemoveOrder(orderedRecipe, diningTable);
@@ -469,7 +536,17 @@ public class CustomerAI : MonoBehaviour, IHasProgress
     }
 
     public CustomerState GetState() => state;
-    public float GetPatienceNormalized() => patienceTimer / maxPatience;
-    public float GetQueuePatienceNormalized() => queuePatienceTimer / maxQueuePatience;
+
+    /// <summary>
+    /// КАРТА «Спешащие гости»: нормализация к ЭФФЕКТИВНОМУ терпению — любые внешние
+    /// читатели (ProgressBarUI и будущие UI) видят ту же скорость, что и UpdateWaiting.
+    /// </summary>
+    public float GetPatienceNormalized()
+    {
+        float effectiveMaxPatience = maxPatience * GetEffectivePatienceMultiplier();
+        return effectiveMaxPatience > 0f ? Mathf.Clamp01(patienceTimer / effectiveMaxPatience) : 0f;
+    }
+
+    public float GetQueuePatienceNormalized() => maxQueuePatience > 0f ? Mathf.Clamp01(queuePatienceTimer / maxQueuePatience) : 0f;
     public RecipeSO GetOrderedRecipe() => orderedRecipe;
 }
