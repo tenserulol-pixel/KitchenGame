@@ -105,8 +105,10 @@ public class GameLoopManager : MonoBehaviour
         switch (state)
         {
             case State.DayPreparation:
-                // В режиме подготовки игрок может нажать ENTER или специальную кнопку, чтобы начать рабочий день
-                if (Input.GetKeyDown(KeyCode.Return))
+                // В режиме подготовки игрок может нажать ENTER, чтобы начать рабочий день.
+                // Пока открыт черновик карт (любой UI с блокировкой ввода) — ENTER заблокирован,
+                // иначе можно было бы начать день, не выбрав карту.
+                if (!IsUiInputLocked() && Input.GetKeyDown(KeyCode.Return))
                 {
                     StartCountdown();
                 }
@@ -360,6 +362,22 @@ public class GameLoopManager : MonoBehaviour
             changeAmount = amount
         });
     }
+        // ===================== БЛОКИРОВКА ВВОДА ДЛЯ UI =====================
+    // Черновик карт (и в будущем магазин/пауза) забирает ввод у игрока, пока его
+    // экран открыт. Счётчик, а не bool — чтобы вложенные экраны (черновик поверх
+    // магазина и т.п.) не разблокировали ввод раньше времени.
+
+    private int uiInputLockCount = 0;
+
+    /// <summary>Экран UI забрал ввод у игрока (черновик карт и т.п.).</summary>
+    public void PushUiInputLock() => uiInputLockCount++;
+
+    /// <summary>Экран UI закрылся — вернуть ввод, если его больше никто не держит.</summary>
+    public void PopUiInputLock() => uiInputLockCount = Mathf.Max(0, uiInputLockCount - 1);
+
+    /// <summary>True, пока открыт экран, блокирующий управление игроком.</summary>
+    public bool IsUiInputLocked() => uiInputLockCount > 0;
+
 
     // Вспомогательные методы проверки текущих состояний игры
     public bool IsPreparationActive() => state == State.DayPreparation;

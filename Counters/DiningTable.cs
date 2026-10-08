@@ -726,42 +726,115 @@ public class DiningTable : BaseCounter
 
     public int GetStoredChairCount() => storedChairs.Count;
 
-    [Header("Проверка места для стульев (после переноса стола)")]
-    [Tooltip("Радиус проверки — примерный физический размер стула")]
+    [Header("Проверка места для стульев (после переноса мебели и на старте сцены)")]
+    [Tooltip("Радиус проверки ПЕРЕСЕЧЕНИЙ — примерный физический размер стула")]
     [SerializeField] private float chairFitCheckRadius = 0.3f;
     [Tooltip("На какой высоте от пола проверяется место — чтобы не задеть коллайдер самого пола")]
     [SerializeField] private float chairFitCheckHeightOffset = 0.4f;
     [Tooltip("Какие слои считаются помехой; по умолчанию — все. Сузьте, если пол/декор даёт ложные срабатывания")]
     [SerializeField] private LayerMask chairFitCheckMask = ~0;
+    [Tooltip("Проверять ли СВОБОДНОЕ ПРОСТРАНСТВО вокруг стула лучами по 4 сторонам. Именно этот этап ловит стену, в которую стул упёрся спинкой")]
+    [SerializeField] private bool chairClearanceCheckEnabled = true;
+    [Tooltip("Минимальное свободное место вокруг стула по каждой из 4 сторон, метры. Стена или мебель ближе этого — стул убирается")]
+    [SerializeField] private float chairClearanceDistance = 0.35f;
+    [Tooltip("При старте сцены автоматически убрать стулья, которым не хватило места (залезли в стену/мебель ещё при расстановке)")]
+    [SerializeField] private bool autoRemoveBlockedChairsOnStart = true;
+
+    private void Start()
+    {
+        if (autoRemoveBlockedChairsOnStart)
+        {
+            // Один кадр ожидания: к этому моменту Awake/Start всех объектов сцены уже
+            // выставили финальные позиции (снап к сетке, StartingLayoutRandomizer и т.п.),
+            // и физические запросы видят сцену в её настоящем виде.
+            StartCoroutine(CheckChairsOnStartRoutine());
+        }
+    }
+
+    private IEnumerator CheckChairsOnStartRoutine()
+    {
+        yield return null;
+        RemoveChairsWithoutRoom();
+    }
 
     /// <summary>
-    /// Физическая проверка через Physics.OverlapSphere — есть ли что-то постороннее
-    /// (стена, другой стол, прилавок) там, где сейчас стоит стул. Коллайдеры самого
-    /// стола и соседних стульев игнорируются через IsChildOf — все они дочерние
-    /// объекты этого же стола, иначе стул считал бы помехой собственный стол.
+    /// Физическая проверка места для стула. Два этапа:
+    ///  1) ПЕРЕСЕЧЕНИЕ (OverlapSphere): чужой коллайдер прямо в объёме стула —
+    ///     стул в стене / в другом столе / в прилавке.
+    ///  2) ЗАЗОР (4 горизонтальных луча по осям): стул ничего не пересекает, но
+    ///     упёрся спинкой в стену или мебель ближе chairClearanceDistance —
+    ///     места для гостя нет, стул убирается. Именно этот этап добавлен для стен.
+    ///
+    /// Свои коллайдеры (сам стул, его стол, соседние стулья этого же стола),
+    /// игрок и гости помехой не считаются — см. IsOwnOrIgnored.
     /// </summary>
-    private bool HasRoomForChair(Chair chair)
+    private bool HasRoomForChair(Chair chair, out string reason)
     {
         Vector3 checkPosition = chair.transform.position + Vector3.up * chairFitCheckHeightOffset;
-        Collider[] overlaps = Physics.OverlapSphere(checkPosition, chairFitCheckRadius, chairFitCheckMask);
 
+        // === Этап 1: пересечение ===
+        Collider[] overlaps = Physics.OverlapSphere(checkPosition, chairFitCheckRadius, chairFitCheckMask);
         foreach (Collider col in overlaps)
         {
-            if (col.transform == chair.transform) continue;
-            if (col.transform == transform || col.transform.IsChildOf(transform)) continue;
+            if (IsOwnOrIgnored(chair, col)) continue;
 
+            reason = $"пересечение с '{GetObstacleName(col)}'";
             return false;
         }
 
+        // === Этап 2: свободное пространство по 4 сторонам ===
+        if (chairClearanceCheckEnabled && chairClearanceDistance > 0f)
+        {
+            Vector3[] checkDirections =
+            {
+                Vector3.forward, Vector3.back, Vector3.left, Vector3.right
+            };
+
+            foreach (Vector3 direction in checkDirections)
+            {
+                if (Physics.Raycast(checkPosition, direction, out RaycastHit hit,
+                                    chairClearanceDistance, chairFitCheckMask))
+                {
+                    if (IsOwnOrIgnored(chair, hit.collider)) continue;
+
+                    reason = $"слишком близко к '{GetObstacleName(hit.collider)}' " +
+                             $"({hit.distance:F2} м, зазор меньше {chairClearanceDistance:F2} м)";
+                    return false;
+                }
+            }
+        }
+
+        reason = null;
         return true;
     }
 
     /// <summary>
-    /// Вызывается FurnitureMovingController'ом сразу после того, как стол успешно
-    /// переставлен. Каждый текущий (не убранный ранее) стул проверяется физически —
-    /// если на новом месте стола рядом с его позицией что-то мешает, стул убирается
-    /// автоматически, тем же способом, что и вручную через E. Снимок списка нужен,
-    /// поскольку RemoveSpecificChair меняет chairs изнутри перебора.
+    /// True, если коллайдер НЕ считается помехой: сам стул, его стол со всей иерархией
+    /// (включая соседние стулья этого же стола — иначе стулья тесного стола убирали бы
+    /// друг друга), игрок (стоит рядом в момент постановки мебели) и гости.
+    /// </summary>
+    private bool IsOwnOrIgnored(Chair chair, Collider col)
+    {
+        if (col == null) return true;
+        if (col.transform == chair.transform) return true;
+        if (col.transform == transform || col.transform.IsChildOf(transform)) return true;
+        if (col.GetComponentInParent<Player>() != null) return true;
+        if (col.GetComponentInParent<CustomerAI>() != null) return true;
+        return false;
+    }
+
+    /// <summary>Имя объекта-помехи для диагностического лога.</summary>
+    private static string GetObstacleName(Collider col)
+    {
+        return col != null ? col.transform.name : "null";
+    }
+
+    /// <summary>
+    /// Проверяет все стулья стола и убирает те, которым не хватило места.
+    /// Вызывается: (1) FurnitureMovingController'ом после ЛЮБОЙ перестановки мебели —
+    /// метод больше не привязан только к перенесённому столу; (2) на старте сцены,
+    /// если включён autoRemoveBlockedChairsOnStart. Снимок списка нужен, поскольку
+    /// RemoveSpecificChair меняет chairs изнутри перебора.
     /// </summary>
     public void RemoveChairsWithoutRoom()
     {
@@ -773,9 +846,9 @@ public class DiningTable : BaseCounter
         {
             if (chair == null) continue;
 
-            if (!HasRoomForChair(chair))
+            if (!HasRoomForChair(chair, out string reason))
             {
-                Debug.Log($"[DiningTable] '{name}': стулу не хватило места после переноса стола — убран автоматически.");
+                Debug.Log($"[DiningTable] '{name}': стул убран автоматически — {reason}.");
                 RemoveSpecificChair(chair);
             }
         }

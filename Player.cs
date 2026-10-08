@@ -76,9 +76,15 @@ public class Player : MonoBehaviour, IKitchenObjectParent
 
     private void Update()
     {
-        // Если в данный момент не идет активная игра (например, идет отсчет или подведение итогов),
-        // полностью блокируем передвижение персонажа и выбор столов.
-        if (GameLoopManager.Instance != null && !GameLoopManager.Instance.IsGamePlaying() && !GameLoopManager.Instance.IsPreparationActive())
+        // Обычная гейтовка по состояниям ИЛИ открытый экран UI (черновик карт):
+        // движение, выбор станций, притяжение к станции и буферы нажатий замирают.
+        bool stateBlocked = GameLoopManager.Instance != null &&
+            !GameLoopManager.Instance.IsGamePlaying() &&
+            !GameLoopManager.Instance.IsPreparationActive();
+        bool uiBlocked = GameLoopManager.Instance != null &&
+            GameLoopManager.Instance.IsUiInputLocked();
+
+        if (stateBlocked || uiBlocked)
         {
             isWalking = false;
             SetSelectedCounter(null);

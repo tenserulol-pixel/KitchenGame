@@ -10,6 +10,9 @@ using UnityEngine;
 ///
 /// Переключение стульев (убрать/вернуть) сюда больше не входит — оно теперь
 /// висит на обычной кнопке E через DiningTable.Interact(), см. этот файл.
+///
+/// После ЛЮБОЙ постановки мебели ВСЕ столы сцены перепроверяют своих стульев
+/// (RecheckAllTableChairs): поставленная мебель могла перекрыть чужой стул.
 /// </summary>
 public class FurnitureMovingController : MonoBehaviour
 {
@@ -49,6 +52,12 @@ public class FurnitureMovingController : MonoBehaviour
                 CancelMove();
             }
 
+            return;
+        }
+                // Черновик карт (или другой UI с блокировкой ввода) открыт — клавиши переноса глушим.
+        // Если мебель уже в руках — перенос просто замирает: игрок тоже замирает.
+        if (GameLoopManager.Instance.IsUiInputLocked())
+        {
             return;
         }
 
@@ -148,19 +157,37 @@ public class FurnitureMovingController : MonoBehaviour
             Debug.Log(
                 $"[FurnitureMoving] '{movingCounter.name}' размещён на новом месте.");
 
-            // Если переставили именно стол — проверяем физически, всем ли его стульям
-            // хватило места на новом месте (пока movingCounter ещё не обнулён FinishMoving()).
-            if (movingCounter is DiningTable table)
-            {
-                table.RemoveChairsWithoutRoom();
-            }
-
+            // ★ ИЗМЕНЕНО: сначала FinishMoving, потом проверка стульев.
+            // FinishMoving возвращает коллайдер переносимой мебели — без него мебель
+            // невидима для физики, и стулья соседних столов не поняли бы, что им тесно.
             FinishMoving();
+
+            // Проверяем стулья ВСЕХ столов, а не только переставленного:
+            // новая мебель (стол, печь, прилавок) могла перекрыть чужие стулья.
+            // Сами столы решают, убирать ли стул, через DiningTable.RemoveChairsWithoutRoom.
+            RecheckAllTableChairs();
         }
         else
         {
             Debug.Log(
                 "[FurnitureMoving] Это место занято — выбери другую ячейку.");
+        }
+    }
+
+    /// <summary>
+    /// Повторная проверка места для стульев всех столов сцены. Столов немного,
+    /// проверка дешёвая (OverlapSphere + до 4 лучей на стул), а вызывается только
+    /// в момент постановки мебели — поэтому обходим все столы без оптимизаций.
+    /// </summary>
+    private void RecheckAllTableChairs()
+    {
+        DiningTable[] allTables = FindObjectsByType<DiningTable>(FindObjectsSortMode.None);
+
+        foreach (DiningTable table in allTables)
+        {
+            if (table == null) continue;
+
+            table.RemoveChairsWithoutRoom();
         }
     }
 
