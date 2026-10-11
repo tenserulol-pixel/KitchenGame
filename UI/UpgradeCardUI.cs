@@ -8,7 +8,12 @@ using TMPro;
 /// но для UpgradeCardSO: отображает иконку/название/flavor-описание/сводку эффектов
 /// и по клику дёргает коллбек, переданный UpgradeDraftUI.
 ///
-/// Логики применения эффектов здесь НЕТ — карточка глупая вьюха: показ + клик + ховер.
+/// Логики применения эффектов здесь НЕТ — карточка глупая вьюха: показ + клик +
+/// ховер + клавиатурная подсветка (SetHighlighted, её включают клавиши A/D).
+/// Подсветка и ховер независимы: ховер — только пока курсор на карточке,
+/// подсветка — пока карточка выбрана клавишами. Визуально оба состояния дают
+/// один и тот же «приподнятый» вид, так что мышь и клавиатура не спорят.
+///
 /// Редкости нет сознательно: все карты — «страницы гримуара», рамка одна для всех.
 ///
 /// Требования к префабу:
@@ -35,7 +40,8 @@ public class UpgradeCardUI : MonoBehaviour, IPointerEnterHandler, IPointerExitHa
     private System.Action<UpgradeCardSO> onPicked;
     private Vector3 baseScale;
     private bool hovered;
-    private float scaleT; // 0 = покой, 1 = ховер
+    private bool highlighted; // выбрана клавишами A/D (см. UpgradeManager.MoveSelection)
+    private float scaleT;     // 0 = покой, 1 = ховер/подсветка
 
     private void Awake()
     {
@@ -76,11 +82,21 @@ public class UpgradeCardUI : MonoBehaviour, IPointerEnterHandler, IPointerExitHa
         if (descriptionText != null) descriptionText.text = card.description;
         if (effectSummaryText != null) effectSummaryText.text = card.GetEffectSummary();
 
-        // Сброс ховера — карточки пересоздаются каждый день
+        // Сброс ховера и подсветки — карточки пересоздаются каждый день
         hovered = false;
+        highlighted = false;
         scaleT = 0f;
         transform.localScale = baseScale;
         if (frameImage != null) frameImage.color = normalFrameColor;
+    }
+
+    /// <summary>
+    /// Клавиатурная подсветка карточки (выбор клавишами A/D).
+    /// Вызывается UpgradeDraftUI.ApplyHighlight при каждом сдвиге подсветки.
+    /// </summary>
+    public void SetHighlighted(bool highlighted)
+    {
+        this.highlighted = highlighted;
     }
 
     /// <summary>
@@ -97,7 +113,9 @@ public class UpgradeCardUI : MonoBehaviour, IPointerEnterHandler, IPointerExitHa
 
     private void Update()
     {
-        float target = hovered ? 1f : 0f;
+        // Ховер мышью и клавиатурная подсветка дают одно и то же «приподнятое»
+        // состояние — как в консольных меню, где курсор и стик управляют одним выбором.
+        float target = (hovered || highlighted) ? 1f : 0f;
         if (Mathf.Approximately(scaleT, target)) return;
 
         scaleT = Mathf.MoveTowards(scaleT, target, hoverLerpSpeed * Time.deltaTime);

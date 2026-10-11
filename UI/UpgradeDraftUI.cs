@@ -6,14 +6,22 @@ using TMPro;
 /// <summary>
 /// Оверлей выбора карт дня («гримуар»). НЕ управляется GameUIManager: сам подписан
 /// на UpgradeManager.OnOfferChanged, перестраивает карточки и виден, только пока
-/// предложение непусто. Оверлей поверх preparationPanel — игрок в подготовке может
-/// ходить и двигать мебель, карточки кликаются мышью.
+/// предложение непусто. Оверлей поверх preparationPanel — игрок в подготовке
+/// заморожен (гейт в Player.cs), карточки выбираются мышью ИЛИ клавиатурой.
+///
+/// Управление:
+/// - мышь: клик по карточке (как раньше);
+/// - клавиатура: A/D — подсветка карточки (UpgradeManager стреляет OnSelectionChanged,
+///   здесь мы её отрисовываем), E — взять подсвеченную (ловит UpgradeManager сам,
+///   сюда нажатие не приходит).
 ///
 /// Структура (собирается в Unity):
 /// - UpgradeDraftRoot (этот компонент, GameObject выключен в сцене)
 ///   - Dim          (Image #000000 alpha ~150 на весь экран, raycastTarget = true —
 ///                   блокирует клики мимо карточек)
 ///   - Title        (TMP — заголовок черновика)
+///   - Hint         (TMP — ОПЦИОНАЛЬНО: строка «A/D — выбор · E — взять · Esc — пропустить»;
+///                   если поле не назначено в инспекторе, подсказка просто не показывается)
 ///   - CardsContainer (GridLayoutGroup, 3 колонки, cellSize ~260x360, spacing 24)
 ///   - CardTemplate (префаб UpgradeCardUI, выключен)
 ///   - SkipButton   (Button «Пропустить»)
@@ -25,6 +33,9 @@ public class UpgradeDraftUI : MonoBehaviour
     [SerializeField] private UpgradeCardUI cardTemplate;
     [SerializeField] private Button skipButton;
     [SerializeField] private TextMeshProUGUI titleText;
+
+    [Tooltip("Опционально: строка подсказки управления. Можно оставить пустым — тогда подсказки просто не будет")]
+    [SerializeField] private TextMeshProUGUI hintText;
 
     [Header("Поведение")]
     [Tooltip("Страховка: прятать оверлей, когда фаза подготовки закончилась " +
@@ -41,6 +52,7 @@ public class UpgradeDraftUI : MonoBehaviour
         if (UpgradeManager.Instance != null)
         {
             UpgradeManager.Instance.OnOfferChanged += UpgradeManager_OnOfferChanged;
+            UpgradeManager.Instance.OnSelectionChanged += UpgradeManager_OnSelectionChanged;
         }
 
         if (skipButton != null)
@@ -61,6 +73,7 @@ public class UpgradeDraftUI : MonoBehaviour
         if (UpgradeManager.Instance != null)
         {
             UpgradeManager.Instance.OnOfferChanged -= UpgradeManager_OnOfferChanged;
+            UpgradeManager.Instance.OnSelectionChanged -= UpgradeManager_OnSelectionChanged;
         }
         if (skipButton != null) skipButton.onClick.RemoveAllListeners();
     }
@@ -82,6 +95,12 @@ public class UpgradeDraftUI : MonoBehaviour
         RefreshFromCurrentOffer();
     }
 
+    private void UpgradeManager_OnSelectionChanged(object sender, UpgradeManager.OnSelectionChangedEventArgs e)
+    {
+        // A/D листают подсветку — отрисовываем её на созданных карточках
+        ApplyHighlight(e.selectedIndex);
+    }
+
     private void RefreshFromCurrentOffer()
     {
         if (UpgradeManager.Instance == null) return;
@@ -96,6 +115,7 @@ public class UpgradeDraftUI : MonoBehaviour
 
         gameObject.SetActive(true);
         RebuildCards(offer);
+        UpdateHintText();
     }
 
     private void RebuildCards(List<UpgradeCardSO> offer)
@@ -120,6 +140,34 @@ public class UpgradeDraftUI : MonoBehaviour
             cardUI.Setup(card, OnCardPicked);
             spawnedCards.Add(cardUI);
         }
+
+        // Подсветка клавиатурного выбора (A/D): берём актуальный индекс у менеджера.
+        // Это же покрывает случай, когда OnSelectionChanged прилетел ДО перестройки
+        // карточек (порядок событий при открытии черновика).
+        ApplyHighlight(UpgradeManager.Instance.GetSelectedDraftIndex());
+    }
+
+    /// <summary>
+    /// Подсвечивает карточку с индексом selectedIndex (клавиатурный выбор A/D),
+    /// остальные возвращает в обычное состояние. Мышинный ховер живёт отдельно
+    /// и с подсветкой не конфликтует.
+    /// </summary>
+    private void ApplyHighlight(int selectedIndex)
+    {
+        for (int i = 0; i < spawnedCards.Count; i++)
+        {
+            if (spawnedCards[i] != null)
+            {
+                spawnedCards[i].SetHighlighted(i == selectedIndex);
+            }
+        }
+    }
+
+    private void UpdateHintText()
+    {
+        if (hintText == null) return;
+
+        hintText.text = "A / D — выбор      E — взять      Esc — пропустить";
     }
 
     private void OnCardPicked(UpgradeCardSO pickedCard)

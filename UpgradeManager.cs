@@ -6,14 +6,49 @@ using UnityEngine;
 /// Раз в день (кроме первого — OnDayChanged стреляет со 2-го) предлагает cardsPerDraft
 /// случайных, ещё не полученных карт улучшений.
 ///
-/// Простые эффекты трогают поля Player/GameLoopManager/CustomerManager напрямую;
-/// синергетические карты (v6) копят МОДИФИКАТОРЫ здесь, а другие системы
-/// (StoveCounter, CustomerAI, DiningTable, DeliveryManager) читают их через геттеры.
-/// Синергии НЕ запрограммированы — возникают сами из стека модификаторов.
+/// UI выбора карт (UpgradeDraftUI) подписывается на событие OnOfferChanged:
+/// - новый черновик → UI строит карточки из GetCurrentOffer();
+/// - PickCard / SkipDraft → currentOffer очищается → UI скрывается сам.
 ///
-/// Алхимический хаос: каждый день один рецепт меняет один "сырой" ингредиент на
-/// другой из пула. Мутирует РАНТАЙМ-копия RecipeSO (Instantiate) — оригинальные
-/// ассеты никогда не изменяются, иначе правка пережила бы выход из Play-режима.
+/// МОДАЛЬНОСТЬ: пока черновик открыт (IsDraftActive == true), ПЕРСОНАЖ заморожен
+/// гейтом в Player.Update — он не ходит, не выбирает станции, не тянет мебель,
+/// буферизованные E/F у него тоже глушатся.
+/// ВАЖНО: Action Map "Player" при этом ОСТАЁТСЯ ВКЛЮЧЁННОЙ! Клавиши A/D и E — это
+/// действия Move и Interact с той самой карты, и они нужны самому черновику
+/// (см. «Управление черновиком» ниже). Блокировка игрока целиком живёт в гейтах
+/// Player.cs, а НЕ в GameInput.DisablePlayerInput().
+///
+/// Управление черновиком с клавиатуры:
+/// - A / D  — листать подсветку по карточкам. Читается СЫРОЕ значение действия Move
+///   (GameInput.GetRawMoveVector) с edge-детектом и автоповтором. Тот же Move, на
+///   котором висит ходьба: когда в будущем стик геймпада будет привязан к Move
+///   (обычно уже привязан), навигация заработает на геймпаде без правок кода.
+/// - E      — подтвердить выбор. Это событие OnInteractAction (Interact), то же,
+///   что взаимодействие со столами: Player во время черновика его игнорирует
+///   (гейт), а UpgradeManager берёт карту. Кнопка South (A/Cross), привязанная
+///   к Interact, подтвердит выбор на геймпаде тоже без правок кода.
+/// - Escape — пропустить черновик. Осознанно легаси-клавиша: это клавиша UI,
+///   а не геймплея, и она обязана работать при любом состоянии Action Map.
+/// Мышь работает как раньше: клик по карточке = взять её.
+///
+/// Эффекты применяются через центральный switch в ApplyEffect() — по образцу
+/// "enum + применятор". Простые эффекты трогают поля Player/GameLoopManager/
+/// CustomerManager напрямую; синергетические карты копят МОДИФИКАТОРЫ здесь,
+/// а другие системы (StoveCounter, CustomerAI, DiningTable, DeliveryManager) читают
+/// их через публичные геттеры. Связь односторонняя: системы не знают, какие карты
+/// взяты, а карты не знают про системы — поэтому добавить новую карту, выражаемую
+/// существующими модификаторами, можно без правок чужих систем.
+///
+/// Синергии (Большие компании + Большие порции, Быстрый огонь + Спешащие гости и т.п.)
+/// НЕ запрограммированы — они возникают сами из стека модификаторов, как в PlateUp.
+///
+/// Алхимический хаос: каждый день один рецепт из chaosRecipeListSO меняет один
+/// "сырой" ингредиент (из chaosIngredientPool) на другой. Мутирует РАНТАЙМ-копия
+/// RecipeSO (Instantiate) — оригинальные ассеты никогда не изменяются, иначе правка
+/// пережила бы выход из Play-режима в редакторе. Ограничение "подменять только
+/// ингредиенты из пула" гарантирует, что mutated-заказ остаётся приготовимым:
+/// подменяются лишь предметы, которые игрок берёт с ContainerCounter, а не
+/// промежуточные продукты котла/резки.
 /// </summary>
 public class UpgradeManager : MonoBehaviour
 {
@@ -21,6 +56,14 @@ public class UpgradeManager : MonoBehaviour
 
     [SerializeField] private UpgradeCardListSO upgradeCardListSO;
     [SerializeField] private int cardsPerDraft = 3;
+
+    [Header("Навигация A/D по карточкам")]
+    [Tooltip("Порог отклонения оси Move, при котором A/D считается нажатой (для стика геймпада)")]
+    [SerializeField] private float navAxisThreshold = 0.5f;
+    [Tooltip("Сколько секунд нужно держать A/D до начала автоповтора")]
+    [SerializeField] private float navRepeatDelay = 0.45f;
+    [Tooltip("Интервал автоповтора шага при удержании A/D")]
+    [SerializeField] private float navRepeatInterval = 0.14f;
 
     [Header("Алхимический хаос")]
     [Tooltip("Список рецептов, который мутирует хаос. Обычно тот же ассет RecipeListSO, что назначен клиентам (CustomerAI).")]
@@ -30,11 +73,39 @@ public class UpgradeManager : MonoBehaviour
 
     /// <summary>
     /// UI-событие: состав предложения изменился (новый черновик / карта взята / скип).
+    /// Подписчик перестраивается из GetCurrentOffer(); пустой список = «скрыть панель».
     /// </summary>
     public event EventHandler OnOfferChanged;
 
+    /// <summary>
+    /// UI-событие: сменилась подсвеченная (выбранная клавишами A/D) карточка.
+    /// Подписчик (UpgradeDraftUI) подсвечивает карточку с этим индексом.
+    /// </summary>
+    public event EventHandler<OnSelectionChangedEventArgs> OnSelectionChanged;
+    public class OnSelectionChangedEventArgs : EventArgs
+    {
+        public int selectedIndex;
+        public int offerCount;
+    }
+
+    /// <summary>
+    /// True, пока на столе есть непройденный черновик (гримуар открыт). По этому флагу
+    /// GameLoopManager блокирует старт дня (Enter), а Player замораживает персонажа.
+    /// </summary>
+    public bool IsDraftActive => currentOffer.Count > 0;
+
     private readonly List<UpgradeCardSO> ownedCards = new List<UpgradeCardSO>();
     private readonly List<UpgradeCardSO> currentOffer = new List<UpgradeCardSO>();
+
+    // Индекс карточки, подсвеченной клавиатурной навигацией A/D. Для мыши не важен:
+    // клик берёт карту напрямую, подсветка лишь следует за A/D.
+    private int selectedDraftIndex;
+
+    // Состояние навигации A/D: сырое значение оси X на прошлом кадре (edge-детект)
+    // и таймеры автоповтора при удержании.
+    private float previousNavX;
+    private float navHeldTime;
+    private float navRepeatTimer;
 
     // === Модификаторы синергетических карт (стартовые значения = "карт нет") ===
     private float rewardBonus = 0f;             // Большие порции + Спешащие гости: +доля к выплате
@@ -71,6 +142,15 @@ public class UpgradeManager : MonoBehaviour
                 OnOfferChanged?.Invoke(this, EventArgs.Empty);
             }
         }
+
+        // E = «подтвердить выбранную карту», пока черновик открыт.
+        // GameInput персистентный (BootScene) — к GameScene он уже существует.
+        // Player подписан на то же событие, но во время черновика его гейт
+        // игнорирует нажатие — конфликтов нет.
+        if (GameInput.Instance != null)
+        {
+            GameInput.Instance.OnInteractAction += GameInput_OnInteractAction;
+        }
     }
 
     private void OnDestroy()
@@ -79,11 +159,17 @@ public class UpgradeManager : MonoBehaviour
         {
             GameLoopManager.Instance.OnDayChanged -= GameLoopManager_OnDayChanged;
         }
+
+        if (GameInput.Instance != null)
+        {
+            GameInput.Instance.OnInteractAction -= GameInput_OnInteractAction;
+        }
     }
 
     private void GameLoopManager_OnDayChanged(object sender, EventArgs e)
     {
-        // Хаос мутирует рецепт на новый день — до раздачи черновика.
+        // Хаос мутирует рецепт на новый день — до раздачи черновика, чтобы логи дня
+        // шли в естественном порядке: хаос → черновик.
         RebuildChaosOrders();
 
         OfferDraft();
@@ -93,20 +179,123 @@ public class UpgradeManager : MonoBehaviour
         OnOfferChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    private void Update()
+    private void GameInput_OnInteractAction(object sender, EventArgs e)
     {
-        // Резервный ввод цифрами — только пока есть что предложить и идёт подготовка.
+        // E во время черновика = подтвердить подсвеченную карту.
+        // В остальные фазы этот хендлер молчит: взаимодействие со столами
+        // обрабатывает Player через то же событие.
         if (currentOffer.Count == 0) return;
         if (GameLoopManager.Instance == null || !GameLoopManager.Instance.IsPreparationActive()) return;
 
-        for (int i = 0; i < currentOffer.Count && i < 9; i++)
+        ConfirmSelection();
+    }
+
+    private void Update()
+    {
+        if (currentOffer.Count == 0) return;
+
+        // Страховка от «вечного замка»: если подготовка кончилась при открытом
+        // черновике (любой будущий путь кода), принудительно закрываем его —
+        // карта просто не берётся. Штатно не срабатывает: StartCountdown
+        // не даёт начать день, пока черновик открыт.
+        if (GameLoopManager.Instance == null || !GameLoopManager.Instance.IsPreparationActive())
         {
-            if (Input.GetKeyDown(KeyCode.Alpha1 + i))
+            SkipDraft();
+            return;
+        }
+
+        // A/D — листать подсветку по карточкам
+        HandleDraftNavigation();
+
+        // Escape — пропустить черновик с клавиатуры (то же, что кнопка «Пропустить»).
+        // Легаси-ввод осознанно: клавиша UI, работает при любом состоянии Action Map.
+        if (Input.GetKeyDown(KeyCode.Escape))
+        {
+            SkipDraft();
+        }
+    }
+
+    /// <summary>
+    /// Навигация A/D по карточкам черновика. Читаем СЫРУЮ ось X действия Move:
+    /// клавиши A/D дают ровно -1/+1, стик геймпада — аналоговое значение.
+    /// Одно нажатие = один шаг; при удержании включается автоповтор
+    /// (navRepeatDelay → navRepeatInterval) — так навигация одинаково комфортна
+    /// и на клавиатуре, и на стике геймпада.
+    /// </summary>
+    private void HandleDraftNavigation()
+    {
+        Vector2 rawMove = GameInput.Instance != null ? GameInput.Instance.GetRawMoveVector() : Vector2.zero;
+        float navX = rawMove.x; // A = -1, D = +1 (клавиатура); стик — аналогово
+
+        // --- Одноразовый шаг: ось пересекла порог с прошлого кадра ---
+        bool pressedNow = Mathf.Abs(navX) >= navAxisThreshold;
+        bool wasPressed = Mathf.Abs(previousNavX) >= navAxisThreshold;
+
+        if (pressedNow && !wasPressed)
+        {
+            MoveSelection(navX > 0f ? 1 : -1);
+            navHeldTime = 0f;
+            navRepeatTimer = 0f;
+        }
+        else if (pressedNow && wasPressed)
+        {
+            // --- Автоповтор при удержании (нужно для стика) ---
+            navHeldTime += Time.deltaTime;
+
+            if (navHeldTime >= navRepeatDelay)
             {
-                PickCard(i);
-                break;
+                navRepeatTimer += Time.deltaTime;
+                if (navRepeatTimer >= navRepeatInterval)
+                {
+                    MoveSelection(navX > 0f ? 1 : -1);
+                    navRepeatTimer = 0f;
+                }
             }
         }
+        else
+        {
+            // Ось отпущена — сбрасываем удержание
+            navHeldTime = 0f;
+            navRepeatTimer = 0f;
+        }
+
+        previousNavX = navX;
+    }
+
+    // ===== Публичное API черновика (UI-клики, клавиатура, будущий геймпад) =====
+
+    /// <summary>
+    /// Индекс карточки, подсвеченной клавиатурной навигацией A/D.
+    /// </summary>
+    public int GetSelectedDraftIndex() => selectedDraftIndex;
+
+    /// <summary>
+    /// Сдвигает подсветку на direction шагов (A = -1, D = +1). По краям цикл:
+    /// с последней карточки на первую и наоборот. Стреляет OnSelectionChanged.
+    /// </summary>
+    public void MoveSelection(int direction)
+    {
+        if (currentOffer.Count == 0) return;
+        if (GameLoopManager.Instance == null || !GameLoopManager.Instance.IsPreparationActive()) return;
+
+        int count = currentOffer.Count;
+        selectedDraftIndex = (selectedDraftIndex + direction % count + count) % count;
+
+        OnSelectionChanged?.Invoke(this, new OnSelectionChangedEventArgs
+        {
+            selectedIndex = selectedDraftIndex,
+            offerCount = count
+        });
+    }
+
+    /// <summary>
+    /// Подтвердить выбор (E): берёт карточку под подсвеченным индексом.
+    /// </summary>
+    public void ConfirmSelection()
+    {
+        if (currentOffer.Count == 0) return;
+
+        PickCard(selectedDraftIndex);
     }
 
     private void OfferDraft()
@@ -144,21 +333,37 @@ public class UpgradeManager : MonoBehaviour
             return;
         }
 
+        // Черновик открыт: подсветка на первой карточке, состояние навигации чистое
+        // (иначе «залипший» с ходьбы A/D дёрнул бы подсветку в первом же кадре).
+        selectedDraftIndex = 0;
+        previousNavX = 0f;
+        navHeldTime = 0f;
+        navRepeatTimer = 0f;
+
+        OnSelectionChanged?.Invoke(this, new OnSelectionChangedEventArgs
+        {
+            selectedIndex = selectedDraftIndex,
+            offerCount = currentOffer.Count
+        });
+
         string log = "[UpgradeManager] Новые карты дня:\n";
         for (int i = 0; i < currentOffer.Count; i++)
         {
             log += $"  {i + 1}) {currentOffer[i].cardName} — {currentOffer[i].GetEffectSummary()}\n";
         }
-        log += "Выбери карту в окне гримуара (или клавишей с соответствующей цифрой), пока идёт подготовка.";
+        log += "Выбор: A/D — листать, E — взять (или мышкой), Escape — пропустить.";
         Debug.Log(log);
     }
 
     /// <summary>
-    /// Взять карту по индексу предложения. Общий путь для UI-клика и клавиш 1/2/3.
+    /// Взять карту по индексу предложения. Общий путь для мыши (гримуар) и клавиатуры
+    /// (E после A/D). По завершении очищает currentOffer и стреляет OnOfferChanged —
+    /// UI скроется сам, а Player разблокирует персонажа (гейт IsDraftActive отпустит).
     /// </summary>
     public void PickCard(int index)
     {
         if (index < 0 || index >= currentOffer.Count) return;
+        if (GameLoopManager.Instance != null && !GameLoopManager.Instance.IsPreparationActive()) return;
 
         UpgradeCardSO picked = currentOffer[index];
         ApplyEffect(picked);
@@ -222,11 +427,11 @@ public class UpgradeManager : MonoBehaviour
                 break;
 
             case UpgradeEffectType.DarkDeal:
-                // ПАТЧ 2: заменить IncreaseAngryCustomerTolerance на DecreaseAngryCustomerTolerance
-                // (метод появится в GameLoopManager после применения Патча 2).
+                // Тёмная сделка (Патч 2): рецепты дешевле, но порог недовольных
+                // СНИЖАЕТСЯ — у карты теперь есть реальная цена.
                 if (Player.Instance != null) Player.Instance.IncreaseRecipeCostMultiplier(card.value);
                 if (GameLoopManager.Instance != null)
-                    GameLoopManager.Instance.IncreaseAngryCustomerTolerance(Mathf.RoundToInt(card.secondaryValue));
+                    GameLoopManager.Instance.DecreaseAngryCustomerTolerance(Mathf.RoundToInt(card.secondaryValue));
                 break;
 
             case UpgradeEffectType.BiggerRarerGroups:
@@ -248,7 +453,8 @@ public class UpgradeManager : MonoBehaviour
             // === Синергетический набор (v6) ===
 
             case UpgradeEffectType.GroupSizeUp:
-                // Большие компании: метод уже существовал для BiggerRarerGroups.
+                // Большие компании: группы крупнее без минусов. Метод уже существовал
+                // для BiggerRarerGroups — тут переиспользуем его.
                 if (CustomerManager.Instance != null)
                     CustomerManager.Instance.IncreaseBaseMaxGroupSize(Mathf.RoundToInt(card.value));
                 break;
@@ -296,7 +502,8 @@ public class UpgradeManager : MonoBehaviour
     }
 
     // === Геттеры модификаторов для других систем ===
-    // Системы НЕ знают, какие карты взяты. Null-проверки в них обязательны:
+    // Системы (StoveCounter/CustomerAI/DiningTable/DeliveryManager) читают значения
+    // отсюда и НЕ знают, какие карты взяты. Null-проверки в них обязательны:
     // UpgradeManager может отсутствовать в тестовых сценах.
 
     public float GetRewardBonus() => rewardBonus;                       // +доля к выплате за заказ
@@ -396,9 +603,10 @@ public class UpgradeManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Пул рецептов для заказов клиентов. При активном хаосе и совпадении с настроенным
-    /// списком возвращается мутировавший, иначе — оригинальный. Заказы, сделанные ДО
-    /// мутации, продолжают жить со своим старым RecipeSO и остаются выполнимыми.
+    /// Пул рецептов для заказов клиентов. CustomerAI вызывает с "своим" списком:
+    /// при активном хаосе и совпадении с настроенным списком возвращается
+    /// мутировавший, иначе — оригинальный. Заказы, сделанные ДО мутации, продолжают
+    /// жить со своим старым RecipeSO и остаются выполнимыми по старому составу.
     /// </summary>
     public List<RecipeSO> GetOrderRecipePool(RecipeListSO baseList)
     {

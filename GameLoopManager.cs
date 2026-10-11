@@ -26,7 +26,7 @@ public class GameLoopManager : MonoBehaviour
 
     private State state;
     private float countdownToStartTimer;
-    
+
     [Header("Цикл Дней и Прогрессия")]
     private int currentDay = 1;
 
@@ -36,13 +36,21 @@ public class GameLoopManager : MonoBehaviour
     [Header("Условие поражения")]
     [Tooltip("Если за одну смену уходит недовольными больше этого числа клиентов — игра окончена")]
     [SerializeField] private int maxAngryCustomersPerDay = 5;
-    
+
     private int totalGold = 0; // Накопленное золото (всего у игрока)
     private int goldEarnedToday = 0; // Заработано золота за сегодня
     private int goldLostToday = 0; // Потеряно золота (штрафы) за сегодня
 
     private int successfulDeliveriesToday = 0; // Успешных заказов за сегодня
     private int failedDeliveriesToday = 0; // Сгоревших/проваленных заказов за сегодня
+
+    // === Система блокировки ввода под модальные экраны (счётчик, а не bool) ===
+    // Гримуар карт и любые будущие модальные экраны (магазин, пауза) pus'ят блокировку
+    // на время своей жизни и pop'ают при закрытии. Именно СЧЁТЧИК: если один экран
+    // открыт поверх другого, закрытие нижнего не снимет защиту верхнего.
+    // Потребители: FurnitureMovingController.Update (перенос мебели замирает),
+    // гейт Enter в DayPreparation ниже (день нельзя начать поверх экрана).
+    private int uiInputLockCount = 0;
 
     // События для обновления золота и очков в UI
     public event EventHandler<OnGoldChangedEventArgs> OnGoldChanged;
@@ -105,10 +113,10 @@ public class GameLoopManager : MonoBehaviour
         switch (state)
         {
             case State.DayPreparation:
-                // В режиме подготовки игрок может нажать ENTER, чтобы начать рабочий день.
-                // Пока открыт черновик карт (любой UI с блокировкой ввода) — ENTER заблокирован,
-                // иначе можно было бы начать день, не выбрав карту.
-                if (!IsUiInputLocked() && Input.GetKeyDown(KeyCode.Return))
+                // Enter стартует день, но НЕ поверх модального экрана (гримуар, магазин
+                // и любые будущие PushUiInputLock-экраны): иначе день начался бы,
+                // пока игрок ещё выбирает карту или покупает мебель.
+                if (Input.GetKeyDown(KeyCode.Return) && !IsUiInputLocked)
                 {
                     StartCountdown();
                 }
@@ -163,12 +171,45 @@ public class GameLoopManager : MonoBehaviour
         }
     }
 
+    // ===== API блокировки ввода под модальные экраны =====
+
+    /// <summary>
+    /// Модальный экран открылся — «прижать» ввод игрока. Каждому Push обязан
+    /// соответствовать ровно один Pop (при закрытии экрана / в OnDestroy).
+    /// Вложенность безопасна: счётчик снимется только когда закроются ВСЕ экраны.
+    /// </summary>
+    public void PushUiInputLock() => uiInputLockCount++;
+
+    /// <summary>
+    /// Модальный экран закрылся — отпустить ввод. Пол по нулю: лишний/двойной Pop
+    /// не уведёт счётчик в минус (иначе одна ошибка навсегда заблокировала бы ввод).
+    /// </summary>
+    public void PopUiInputLock() => uiInputLockCount = Mathf.Max(0, uiInputLockCount - 1);
+
+    /// <summary>
+    /// True, пока хоть один модальный экран держит блокировку.
+    /// Читается FurnitureMovingController (перенос мебели замирает) и гейтом Enter выше.
+    /// </summary>
+    public bool IsUiInputLocked => uiInputLockCount > 0;
+
     /// <summary>
     /// Запуск обратного отсчета для начала рабочего дня.
     /// </summary>
     public void StartCountdown()
     {
         if (state != State.DayPreparation) return;
+
+        // Черновик карт обязан быть закрыт до старта дня: гримуар — модальный экран,
+        // персонаж заморожен гейтом в Player.cs. Если бы день начался при открытом
+        // черновике, карты «провисли» бы до следующего дня (страховка-автоскип в
+        // UpgradeManager всё же закрыла бы их, но игрок потерял бы выбор).
+        // Путь навигации: A/D — подсветка, E — взять; или мышь; или Escape — пропустить.
+        if (UpgradeManager.Instance != null && UpgradeManager.Instance.IsDraftActive)
+        {
+            Debug.Log("[GameLoop] Сначала выбери карту улучшения: A/D — листать, E — взять " +
+                      "(или мышкой), Escape — пропустить.");
+            return;
+        }
 
         countdownToStartTimer = countdownToStartTimerMax;
         state = State.CountdownToStart;
@@ -237,13 +278,13 @@ public class GameLoopManager : MonoBehaviour
     {
         currentDay++;
         ResetDayStats();
-        
+
         state = State.DayPreparation;
-        
+
         // Оповещаем другие системы (например, спавнер клиентов может увеличить сложность на основе дня)
         OnDayChanged?.Invoke(this, EventArgs.Empty);
         OnStateChanged?.Invoke(this, EventArgs.Empty);
-        
+
         Debug.Log($"[GameLoop] Началась подготовка к Дню {currentDay}. Настройте кухню и нажмите Enter.");
     }
 
@@ -271,10 +312,10 @@ public class GameLoopManager : MonoBehaviour
 
         goldEarnedToday += amount;
         successfulDeliveriesToday++;
-        
-        OnGoldChanged?.Invoke(this, new OnGoldChangedEventArgs { 
-            currentTotalGold = totalGold + (goldEarnedToday - goldLostToday), 
-            changeAmount = amount 
+
+        OnGoldChanged?.Invoke(this, new OnGoldChangedEventArgs {
+            currentTotalGold = totalGold + (goldEarnedToday - goldLostToday),
+            changeAmount = amount
         });
     }
 
@@ -289,10 +330,10 @@ public class GameLoopManager : MonoBehaviour
 
         goldLostToday += basePenaltyPerOrder;
         failedDeliveriesToday++;
-        
-        OnGoldChanged?.Invoke(this, new OnGoldChangedEventArgs { 
-            currentTotalGold = Mathf.Max(0, totalGold + (goldEarnedToday - goldLostToday)), 
-            changeAmount = -basePenaltyPerOrder 
+
+        OnGoldChanged?.Invoke(this, new OnGoldChangedEventArgs {
+            currentTotalGold = Mathf.Max(0, totalGold + (goldEarnedToday - goldLostToday)),
+            changeAmount = -basePenaltyPerOrder
         });
 
         if (failedDeliveriesToday >= maxAngryCustomersPerDay)
@@ -346,6 +387,11 @@ public class GameLoopManager : MonoBehaviour
     // Для UpgradeManager — карта "терпимость к недовольным" поднимает порог поражения.
     public void IncreaseAngryCustomerTolerance(int amount) => maxAngryCustomersPerDay += amount;
 
+    // Для карты "Тёмная сделка" (Патч 2) — снижает порог поражения, но не ниже 1:
+    // порог 0 означал бы мгновенное поражение от первого же недовольного клиента.
+    public void DecreaseAngryCustomerTolerance(int amount) =>
+        maxAngryCustomersPerDay = Mathf.Max(1, maxAngryCustomersPerDay - amount);
+
     // Для карты "Мягкая рука" — снижает штраф за проваленный заказ, не ниже нуля
     // (отрицательный штраф означал бы получать деньги за провал, что не имеет смысла).
     public void ReducePenaltyPerOrder(int amount) => basePenaltyPerOrder = Mathf.Max(0, basePenaltyPerOrder - amount);
@@ -362,22 +408,6 @@ public class GameLoopManager : MonoBehaviour
             changeAmount = amount
         });
     }
-        // ===================== БЛОКИРОВКА ВВОДА ДЛЯ UI =====================
-    // Черновик карт (и в будущем магазин/пауза) забирает ввод у игрока, пока его
-    // экран открыт. Счётчик, а не bool — чтобы вложенные экраны (черновик поверх
-    // магазина и т.п.) не разблокировали ввод раньше времени.
-
-    private int uiInputLockCount = 0;
-
-    /// <summary>Экран UI забрал ввод у игрока (черновик карт и т.п.).</summary>
-    public void PushUiInputLock() => uiInputLockCount++;
-
-    /// <summary>Экран UI закрылся — вернуть ввод, если его больше никто не держит.</summary>
-    public void PopUiInputLock() => uiInputLockCount = Mathf.Max(0, uiInputLockCount - 1);
-
-    /// <summary>True, пока открыт экран, блокирующий управление игроком.</summary>
-    public bool IsUiInputLocked() => uiInputLockCount > 0;
-
 
     // Вспомогательные методы проверки текущих состояний игры
     public bool IsPreparationActive() => state == State.DayPreparation;

@@ -76,6 +76,24 @@ public class GameInput : MonoBehaviour
         return inputVector;
     }
 
+    /// <summary>
+    /// Сырой (НЕ нормализованный) вектор действия Move — того же, на котором висит
+    /// ходьба (WASD). Клавиши A/D дают ровно (-1, 0) и (1, 0); стик геймпада —
+    /// аналоговые значения от -1 до 1.
+    ///
+    /// Зачем нужен отдельно: GetMovementVectorNormalized нормализует вектор, а меню-
+    /// навигации (выбор карт улучшений A/D) важен ФАКТ отклонения оси, а не её длина.
+    ///
+    /// Геймпад-готовность: когда стик геймпада привязан к действию Move (в стандартных
+    /// биндингах он обычно уже привязан), навигация A/D заработает на геймпаде
+    /// без единой правки кода.
+    /// </summary>
+    public Vector2 GetRawMoveVector()
+    {
+        if (playerInput == null) return Vector2.zero;
+        return playerInput.Player.Move.ReadValue<Vector2>();
+    }
+
     // ВАЖНО: Этот метод проверяет, зажата ли кнопка в данный кадр
     public bool IsInteractAlternatePressed()
     {
@@ -100,6 +118,9 @@ public class GameInput : MonoBehaviour
 
     /// <summary>
     /// Выключает Action Map "Player" — например, в главном меню или при открытии паузы.
+    /// ВНИМАНИЕ: черновик карт улучшений НЕ использует этот метод — ему нужны живые
+    /// A/D и E с карты "Player" для навигации по гримуару. Игрока там замораживает
+    /// гейт в Player.Update, а не выключение ввода.
     /// </summary>
     public void DisablePlayerInput()
     {

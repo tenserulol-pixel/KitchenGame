@@ -76,15 +76,21 @@ public class Player : MonoBehaviour, IKitchenObjectParent
 
     private void Update()
     {
-        // Обычная гейтовка по состояниям ИЛИ открытый экран UI (черновик карт):
-        // движение, выбор станций, притяжение к станции и буферы нажатий замирают.
-        bool stateBlocked = GameLoopManager.Instance != null &&
-            !GameLoopManager.Instance.IsGamePlaying() &&
-            !GameLoopManager.Instance.IsPreparationActive();
-        bool uiBlocked = GameLoopManager.Instance != null &&
-            GameLoopManager.Instance.IsUiInputLocked();
+        // Если в данный момент не идет активная игра (например, идет отсчет или подведение итогов),
+        // полностью блокируем передвижение персонажа и выбор столов.
+        if (GameLoopManager.Instance != null && !GameLoopManager.Instance.IsGamePlaying() && !GameLoopManager.Instance.IsPreparationActive())
+        {
+            isWalking = false;
+            SetSelectedCounter(null);
+            return;
+        }
 
-        if (stateBlocked || uiBlocked)
+        // Черновик карт (гримуар открыт): полная заморозка игрока. ЭТО ГЛАВНЫЙ
+        // БЛОКИРОВЩИК — Action Map "Player" остаётся включённой, потому что A/D и E
+        // (действия Move и Interact) нужны самому черновику для навигации по гримуару.
+        // Гейт глушит: ходьбу, луч выбора станции, автопритяжение (HandleCounterSnap),
+        // буферизованные нажатия E/F и передачу зажатия F станциям.
+        if (UpgradeManager.Instance != null && UpgradeManager.Instance.IsDraftActive)
         {
             isWalking = false;
             SetSelectedCounter(null);
@@ -363,6 +369,12 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         if (GameLoopManager.Instance != null && !GameLoopManager.Instance.IsGamePlaying() && !GameLoopManager.Instance.IsPreparationActive())
             return;
 
+        // Черновик карт: во время гримуара E занята подтверждением выбора карты —
+        // это нажатие забирает UpgradeManager (подписан на то же событие), а здесь
+        // взаимодействие со столами не срабатывает и в буфер не попадает.
+        if (UpgradeManager.Instance != null && UpgradeManager.Instance.IsDraftActive)
+            return;
+
         if (selectedCounter != null)
         {
             selectedCounter.Interact(this);
@@ -382,6 +394,10 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     private void GameInput_OnInteractAlternateAction(object sender, EventArgs e)
     {
         if (GameLoopManager.Instance != null && !GameLoopManager.Instance.IsGamePlaying() && !GameLoopManager.Instance.IsPreparationActive())
+            return;
+
+        // Черновик карт: F не работает, пока открыт гримуар (см. комментарий выше).
+        if (UpgradeManager.Instance != null && UpgradeManager.Instance.IsDraftActive)
             return;
 
         if (selectedCounter != null)
