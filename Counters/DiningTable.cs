@@ -36,6 +36,13 @@ public class DiningTable : BaseCounter
     private int finishedEatingCountCached = 0; // Сколько гостей реально поели (для точного количества посуды)
     private int dirtyPlatesCount = 0; // Сколько грязных тарелок сейчас физически находится на столе
 
+    // FIX: флаг «группа за этим столом уже полностью ушла и стол приведён в порядок».
+    // Без него вложенные вызовы OnCustomerLeft (каскад «один уходит — все уходят»)
+    // выполняли блок очистки НЕСКОЛЬКО раз: второй проход видел finishedEatingCountCached == 0
+    // и вызывал CleanTable() поверх только что установленной Dirty —
+    // стопка грязной посуды исчезала, стол возвращался в Free без уборки.
+    private bool groupCleanupDone = false;
+
     // === КАРТЫ АПГРЕЙДОВ ===
     // «Общий заказ» (SameDishChance) и «Большие порции» (BigPortions) опрашиваются
     // на ходу через DeliveryManager.HasUpgrade() — ничего не нужно включать/выключать
@@ -190,6 +197,7 @@ public class DiningTable : BaseCounter
         currentCustomers.Clear();
         finishedEatingCustomers.Clear();
         finishedEatingCountCached = 0;
+        groupCleanupDone = false; // FIX: новая группа — снова разрешаем однократную очистку
 
         // КАРТЫ: сброс состояния группы. pendingSeatCount = размер группы —
         // когда каждый гость сядет (CustomerSeated), счётчик дойдёт до нуля
@@ -201,9 +209,21 @@ public class DiningTable : BaseCounter
         currentCustomers.AddRange(customers);
         SetOccupied();
 
+        // FIX: рассадка через GetFreeChair(), а не chairs[i]. Раньше стул выбирался
+        // строго по индексу: если стул остался помечен занятым от предыдущей группы
+        // (или был убран через E и массив пересобрался), гость получал «чужой» или
+        // де-факто недостижимый стул — и после 3 неудачных попыток уводил за собой
+        // всю группу через каскад OnCustomerLeft.
         for (int i = 0; i < customers.Count; i++)
         {
-            customers[i].SetTargetSeat(chairs[i], this);
+            Chair freeChair = GetFreeChair();
+            if (freeChair == null)
+            {
+                Debug.LogError($"[DiningTable] '{name}': свободные стулья кончились при рассадке " +
+                               $"(рассажено {i} из {customers.Count}). Проверь ClearCustomer у стульев.");
+                break;
+            }
+            customers[i].SetTargetSeat(freeChair, this);
         }
     }
 
@@ -309,22 +329,47 @@ public class DiningTable : BaseCounter
         Debug.Log($"[DiningTable] «Большие порции»: группа ушла, не доев {cancelled} доп. блюдо(а) — заказы сняты.");
     }
 
-    public void OnCustomerLeft(CustomerAI customer)
+    /// <summary>
+    /// Гость уходит за этим столом.
+    ///
+    /// FIX 1: параметр pullWholeGroup. Гость, который так и не дошёл до стула
+    /// (CustomerAI.AbandonUnreachableSeat → LeaveTable(pullWholeGroup: false)),
+    /// вычеркивается из группы БЕЗ каскада: сидящие с заказами гости остаются.
+    /// Сидящий гость, потерявший терпение (LeaveTableAngry), по-прежнему уводит всех —
+    /// это осознанный дизайн «один уходит — все уходят».
+    ///
+    /// FIX 2: finishedEatingCustomers тоже чистится — раньше ушедший после еды гость
+    /// оставался в этом списке и искажал проверку «все ли поели».
+    ///
+    /// FIX 3: groupCleanupDone — блок очистки выполняется ровно один раз. Раньше
+    /// вложенные вызовы каскада гоняли очистку повторно, и второй проход вызывал
+    /// CleanTable() поверх Dirty — грязная посуда исчезала.
+    /// </summary>
+    public void OnCustomerLeft(CustomerAI customer, bool pullWholeGroup = true)
     {
-        currentCustomers.Remove(customer);
+        if (customer == null) return;
 
-        // Защита: Если один гость уходит (например, разозлился), принудительно уводим всю оставшуюся группу
-        if (currentCustomers.Count > 0)
+        currentCustomers.Remove(customer);
+        finishedEatingCustomers.Remove(customer);
+
+        // Защита: если СИДЯЩИЙ гость уходит (например, разозлился) — принудительно
+        // уводим всю оставшуюся группу. Отказавшегося от места «ходока» — не трогаем.
+        if (pullWholeGroup && currentCustomers.Count > 0)
         {
             List<CustomerAI> remaining = new List<CustomerAI>(currentCustomers);
             foreach (CustomerAI remainingCustomer in remaining)
             {
-                remainingCustomer.LeaveTable();
+                if (remainingCustomer != null)
+                {
+                    remainingCustomer.LeaveTable();
+                }
             }
         }
 
-        if (currentCustomers.Count == 0)
+        if (currentCustomers.Count == 0 && !groupCleanupDone)
         {
+            groupCleanupDone = true;
+
             // КАРТЫ: сначала снимаем недоставленные доп. блюда — до переключения состояния
             CancelExtraPortions();
 
@@ -545,6 +590,8 @@ public class DiningTable : BaseCounter
         extraPortionOrders.Clear();
         extraPortionsRegistered = false;
         pendingSeatCount = 0;
+
+        groupCleanupDone = true; // FIX: стол приведён в порядок — очистка группы выполнена
 
         SetFree();
 

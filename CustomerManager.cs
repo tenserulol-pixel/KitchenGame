@@ -222,9 +222,13 @@ public class CustomerManager : MonoBehaviour
     /// <summary>
     /// Пересчитывает параметры спавна на основе номера текущего дня.
     /// Значения из инспектора = баланс 1-го дня, дальше — постепенно сложнее, с ограничениями сверху/снизу.
-    /// Здесь же сбрасывается groupsSpawnedToday — раз в день, в момент начала подготовки к нему.
+    ///
+    /// FIX: параметр resetDailyCounter. Раньше groupsSpawnedToday сбрасывался при КАЖДОМ
+    /// вызове, включая покупку карт апгрейдов посреди дня (IncreaseBaseMaxGroupSize,
+    /// DecreaseBase* и т.д.) — дневная норма групп начиналась заново, и за день приходило
+    /// больше групп, чем планировалось. Теперь сброс происходит только при смене дня.
     /// </summary>
-    private void ApplyDayDifficulty(int day)
+    private void ApplyDayDifficulty(int day, bool resetDailyCounter = true)
     {
         int daysPassed = Mathf.Max(0, day - 1);
 
@@ -235,7 +239,12 @@ public class CustomerManager : MonoBehaviour
         maxGroupSize = Mathf.Min(maxGroupSizeCap, baseMaxGroupSize + groupSizeIncrease);
 
         dailyGroupTarget = Mathf.Min(dailyGroupTargetCap, baseDailyGroupTarget + dailyGroupTargetIncreasePerDay * daysPassed);
-        groupsSpawnedToday = 0;
+
+        // FIX: сброс дневного счётчика — только при смене дня, а не при пересчёте от карт.
+        if (resetDailyCounter)
+        {
+            groupsSpawnedToday = 0;
+        }
 
         Debug.Log($"[CustomerManager] День {day}: интервал спавна {spawnInterval:F1}с, " +
                   $"макс. клиентов {maxCustomers}, макс. размер группы {maxGroupSize}, " +
@@ -263,16 +272,25 @@ public class CustomerManager : MonoBehaviour
     {
         // Сегодняшняя норма уже выполнена — новых групп больше не будет, день
         // завершится сам, как только последние клиенты разойдутся (см. IsDailyWorkloadComplete).
+        // FIX: добавлен лог — раньше этот выход был «немым», и было невозможно понять,
+        // почему группа не пришла (норма? лимит? очередь?).
         if (groupsSpawnedToday >= dailyGroupTarget)
         {
+            Debug.Log($"[SPAWN] Норма дня выполнена ({groupsSpawnedToday}/{dailyGroupTarget}) — новые группы сегодня не спавнятся.");
             return;
         }
+
+        // FIX: подчищаем уничтоженных клиентов, чтобы мёртвые ссылки (гость удалён
+        // где-то мимо RemoveCustomer) не раздували счётчик и не блокировали спавн
+        // через лимит «customerList.Count + groupSize > maxCustomers» навсегда.
+        customerList.RemoveAll(c => c == null);
 
         int groupSize = UnityEngine.Random.Range(minGroupSize, maxGroupSize + 1);
 
         // Не превышаем лимит клиентов
         if (customerList.Count + groupSize > maxCustomers)
         {
+            Debug.Log($"[SPAWN] Лимит: в зале {customerList.Count} + группа {groupSize} > maxCustomers {maxCustomers} — спавн отложен до следующего интервала.");
             return;
         }
 
@@ -330,7 +348,8 @@ public class CustomerManager : MonoBehaviour
         table.OccupyTable(group);
         groupsSpawnedToday++;
 
-        Debug.Log($"Создана группа из {groupSize} человек. Групп сегодня: {groupsSpawnedToday}/{dailyGroupTarget}.");
+        Debug.Log($"Создана группа из {groupSize} человек. Групп сегодня: {groupsSpawnedToday}/{dailyGroupTarget}. " +
+                  $"В зале сейчас: {customerList.Count}/{maxCustomers}.");
     }
 
     /// <summary>
@@ -443,7 +462,13 @@ public class CustomerManager : MonoBehaviour
         }
     }
 
-    public int GetCustomerCount() => customerList.Count;
+    public int GetCustomerCount()
+    {
+        // FIX: чистим мёртвые ссылки перед чтением — иначе Count врёт после любых
+        // удалений гостей мимо RemoveCustomer (ручные Delete, выгрузка и т.п.).
+        customerList.RemoveAll(c => c == null);
+        return customerList.Count;
+    }
 
     public bool HasFreeTable(int groupSize) => FindAvailableTable(groupSize) != null;
 
@@ -456,8 +481,16 @@ public class CustomerManager : MonoBehaviour
     /// День выполнен, когда сегодняшняя норма групп заспавнена И в зале никого не осталось
     /// (все либо обслужены и ушли, либо ушли недовольными). Используется GameLoopManager'ом
     /// вместо таймера для завершения GamePlaying.
+    ///
+    /// FIX: RemoveAll перед проверкой — одна затесавшаяся мёртвая ссылка делала
+    /// customerList.Count навсегда больше нуля, день никогда не завершался,
+    /// и игра зависала в состоянии GamePlaying с пустым рестораном.
     /// </summary>
-    public bool IsDailyWorkloadComplete() => groupsSpawnedToday >= dailyGroupTarget && customerList.Count == 0;
+    public bool IsDailyWorkloadComplete()
+    {
+        customerList.RemoveAll(c => c == null);
+        return groupsSpawnedToday >= dailyGroupTarget && customerList.Count == 0;
+    }
 
     public int GetGroupsSpawnedToday() => groupsSpawnedToday;
     public int GetDailyGroupTarget() => dailyGroupTarget;
@@ -477,6 +510,8 @@ public class CustomerManager : MonoBehaviour
     /// при следующем ApplyDayDifficulty (на следующем дне) значение бы перетёрлось.
     /// После изменения сразу пересчитываем maxGroupSize через ApplyDayDifficulty,
     /// чтобы апгрейд подействовал немедленно, а не ждал следующего дня.
+    /// FIX: resetDailyCounter: false — покупка карты посреди дня больше не сбрасывает
+    /// дневную норму групп.
     /// </summary>
     public void IncreaseBaseMaxGroupSize(int amount)
     {
@@ -485,7 +520,7 @@ public class CustomerManager : MonoBehaviour
 
         if (GameLoopManager.Instance != null)
         {
-            ApplyDayDifficulty(GameLoopManager.Instance.GetCurrentDay());
+            ApplyDayDifficulty(GameLoopManager.Instance.GetCurrentDay(), resetDailyCounter: false);
         }
 
         Debug.Log($"[CustomerManager] Базовый макс. размер группы увеличен на {amount}. " +
@@ -535,18 +570,9 @@ public class CustomerManager : MonoBehaviour
         foreach (CustomerAI c in groupToDisband)
         {
             if (c == null) continue;
-            if (c == caller)
-            {
-                // На самого caller тоже вызываем LeaveQueue — он должен переключить состояние
-                // на Leaving и удалить себя из customerList. Штраф уже был начислен в
-                // LeaveQueueAngry, поэтому тут именно LeaveQueue, а не LeaveQueueAngry.
-                c.LeaveQueue();
-            }
-            else
-            {
-                // Остальных утягиваем за собой — без доп. штрафа, они же не сами потеряли терпение.
-                c.LeaveQueue();
-            }
+            // Штраф уже был начислен в LeaveQueueAngry — здесь всем вызываем LeaveQueue,
+            // чтобы не списывать золото повторно.
+            c.LeaveQueue();
         }
 
         Debug.Log($"[CustomerManager] Очередная группа распущена (caller: {caller.name}). Осталось в очереди: {queuedGroups.Count}.");
@@ -555,6 +581,7 @@ public class CustomerManager : MonoBehaviour
     /// <summary>
     /// Уменьшает БАЗОВЫЙ дневной таргет групп (не меняя прироста по дням).
     /// Для карты «Большие компании» — группы становятся крупнее, но приходят реже.
+    /// FIX: resetDailyCounter: false — карта больше не сбрасывает дневную норму посреди дня.
     /// </summary>
     public void DecreaseBaseDailyGroupTarget(int amount)
     {
@@ -563,7 +590,7 @@ public class CustomerManager : MonoBehaviour
 
         if (GameLoopManager.Instance != null)
         {
-            ApplyDayDifficulty(GameLoopManager.Instance.GetCurrentDay());
+            ApplyDayDifficulty(GameLoopManager.Instance.GetCurrentDay(), resetDailyCounter: false);
         }
 
         Debug.Log($"[CustomerManager] Базовый дневной таргет групп уменьшен на {amount}. " +
@@ -573,6 +600,7 @@ public class CustomerManager : MonoBehaviour
     /// <summary>
     /// Уменьшает БАЗОВЫЙ интервал спавна между группами.
     /// Для карты «Час пик» — группы приходят чаще, но компенсируется уменьшением maxCustomers.
+    /// FIX: resetDailyCounter: false — карта больше не сбрасывает дневную норму посреди дня.
     /// </summary>
     public void DecreaseBaseSpawnInterval(float amount)
     {
@@ -581,7 +609,7 @@ public class CustomerManager : MonoBehaviour
 
         if (GameLoopManager.Instance != null)
         {
-            ApplyDayDifficulty(GameLoopManager.Instance.GetCurrentDay());
+            ApplyDayDifficulty(GameLoopManager.Instance.GetCurrentDay(), resetDailyCounter: false);
         }
 
         Debug.Log($"[CustomerManager] Базовый интервал спавна уменьшен на {amount:F1}с. " +
@@ -591,6 +619,7 @@ public class CustomerManager : MonoBehaviour
     /// <summary>
     /// Уменьшает БАЗОВЫЙ максимум одновременных клиентов (не меняя прироста по дням).
     /// Для карты «Час пик» — балансировка: чаще приходят, но меньше одновременно.
+    /// FIX: resetDailyCounter: false — карта больше не сбрасывает дневную норму посреди дня.
     /// </summary>
     public void DecreaseBaseMaxCustomers(int amount)
     {
@@ -601,7 +630,7 @@ public class CustomerManager : MonoBehaviour
 
         if (GameLoopManager.Instance != null)
         {
-            ApplyDayDifficulty(GameLoopManager.Instance.GetCurrentDay());
+            ApplyDayDifficulty(GameLoopManager.Instance.GetCurrentDay(), resetDailyCounter: false);
         }
 
         Debug.Log($"[CustomerManager] Базовый макс. клиентов уменьшен на {amount}. " +

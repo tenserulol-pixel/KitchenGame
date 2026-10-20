@@ -1,52 +1,7 @@
+using System.Collections.Generic;
 using UnityEngine;
 
-/// <summary>
-/// Физическая дверь для гостей — v2 «улучшенная физика».
-///
-/// ЧТО ИЗМЕНИЛОСЬ ОТНОСИТЕЛЬНО v1 (вариант А «магический триггер»):
-/// В Task 31 гости получили CapsuleCollider + кинематический Rigidbody
-/// (CustomerCollision). Теперь гость — физическое тело: его капсула
-/// при касании ВЫТАЛКИВАЕТ динамичное полотно двери силами PhysX.
-/// Магия v1 (створка распахивалась сама за 2.2 м до гостя, а вплотную
-/// коллайдер полотна вообще выключался) больше не нужна и вредит:
-/// дверь открывалась до касания, а выключенный коллайдер позволял
-/// ИГРОКУ пройти сквозь закрытую дверь, пока рядом стоял гость.
-///
-/// КАК РАБОТАЕТ v2 (3 уровня, от физики к страховке):
-///
-/// 1) ФИЗИЧЕСКИЙ ТОЛЧОК (основной). Гость идёт к двери и УПИРАЕТСЯ в
-///    закрытую створку телом. Кинематическая капсула гостя продавливает
-///    динамический Rigidbody полотна — дверь распахивается от толчка,
-///    как настоящая. Rigidbody.maxDepenetrationVelocity ограничивает
-///    скорость выталкивания, чтобы дверь не «выстреливала» от касания.
-///
-/// 2) КОНТАКТНЫЙ АССИСТ. Когда гость вплотную к полотну (pushAssistRadius),
-///    на створку подаётся мягкий крутящий момент ОТ гостя — как будто её
-///    дожимают плечом. Это гарантия, что дверь открывается быстрее, чем
-///    гость идёт: гость не успевает добежать до ещё закрытого полотна.
-///    Если гость почти вплотную, а створка всё ещё почти закрыта —
-///    момент удваивается (анти-клип буст).
-///
-/// 3) АВАРИЙНЫЙ ПРОПУСК (последний рубеж). Если гость уже в 0.5 м от
-///    центра проёма, а створка всё ещё почти закрыта (физика не успела,
-///    гостя заспавнили в проёме) — коллайдеры полотна на время
-///    выключаются, чтобы не было видимого прохода сквозь доску.
-///    В v1 это был основной режим с радиусом 1.1; теперь условия
-///    настолько жёсткие, что срабатывает почти никогда.
-///
-/// 4) Гость отошёл дальше closeRadius → ассист выключается, пружина
-///    автозакрытия из PhysicalDoor доводит створку сама.
-///
-/// ЧТО НЕ ТРОГАЕТ:
-/// PhysicalDoor.cs и BodyPusher.cs не изменяются. Толкание двери игроком,
-/// пружина, лимиты петли — всё работает как раньше. CustomerCollision.cs
-/// (толкание гостей и игрока) — не изменяется.
-///
-/// НАСТРОЙКА СЦЕНЫ:
-/// Повесь компонент на дверное ПОЛОТНО — тот объект, где уже висят
-/// PhysicalDoor и Rigidbody. Rigidbody полотна должен быть динамическим
-/// (НЕ isKinematic), иначе физический толчок гостей не работает.
-/// </summary>
+
 [RequireComponent(typeof(Rigidbody))]
 public class CustomerDoorOpener : MonoBehaviour
 {
@@ -94,6 +49,20 @@ public class CustomerDoorOpener : MonoBehaviour
              "для аварийного пропуска.")]
     [SerializeField] private float emergencyMaxDoorAngle = 20f;
 
+    [Header("Призрачная дверь по времени контакта (v2.1)")]
+    [Tooltip("Если клиент непрерывно упирается в полотно дольше этого времени (сек) и не может пройти — полотно становится призрачным: коллайдер выключается, клиент проходит, потом коллайдер возвращается. 0 = выключить призрака по времени, останется только аварийный радиус.")]
+    [SerializeField] private float pushTimeToGhost = 2.5f;
+    [Tooltip("Тело, движущееся быстрее этой скорости (м/с), не считается «упирающимся» — отсекает гостей, проходящих мимо на бегу.")]
+    [SerializeField] private float stuckSpeedThreshold = 1f;
+    [Tooltip("Минимальное время призрачного состояния (сек) — защита от мерцания коллайдера.")]
+    [SerializeField] private float ghostMinTime = 0.4f;
+    [Tooltip("Призрак снимается, когда никто из гостей не подходит к «линии полотна» ближе этого радиуса (м). Примерно радиус капсулы гостя + запас.")]
+    [SerializeField] private float leafClearRadius = 0.45f;
+    [Tooltip("Пауза после возврата коллайдера (сек), прежде чем дверь снова сможет стать призрачной.")]
+    [SerializeField] private float ghostCooldown = 0.5f;
+    [Tooltip("Логировать включение/выключение призрачного режима — полезно при отладке застреваний.")]
+    [SerializeField] private bool ghostDebugLogs = true;
+
     [Header("Служебное")]
     [Tooltip("Как часто искать гостей (сек). Клиентов мало, но и сканировать " +
              "каждый кадр незачем.")]
@@ -118,8 +87,26 @@ public class CustomerDoorOpener : MonoBehaviour
     private float scanTimer;
 
     // Текущее состояние аварийного пропуска — коллайдеры переключаются
-    // только на смене состояния, а не каждый кадр.
+    // только на смене состояния, а не каждый кадр. С v2.1 этот флаг общий
+    // для обеих причин призрака: и аварийный радиус, и долгий контакт.
     private bool emergencyPass;
+
+    // Призрак сработал из-за долгого контакта, а не аварийного радиуса (для логов).
+    private bool ghostByStuck;
+    private float ghostedAt;
+    private float ghostCooldownUntil;
+
+    // Накопленное время НЕПРЕРЫВНОГО контакта гостей с полотном.
+    // Ключ — Rigidbody гостя; контакт прервался — таймер гостя обнуляется.
+    private readonly Dictionary<Rigidbody, float> pushTimers = new Dictionary<Rigidbody, float>();
+
+    // Кто контактировал на последнем физическом шаге (для сброса ушедших).
+    private readonly HashSet<Rigidbody> stepTouches = new HashSet<Rigidbody>();
+
+    // Длина полотна: расстояние петля → центр масс × 2. Снимается в Start,
+    // пока дверь закрыта. Нужна геометрической проверке «линии полотна»,
+    // потому что при выключенных коллайдерах физика контактов молчит.
+    private float leafLength;
 
     private void Start()
     {
@@ -141,6 +128,14 @@ public class CustomerDoorOpener : MonoBehaviour
             // Плавный физический толчок: капсула гостя выдавливает полотно
             // с ограниченной скоростью, без «выстрела» двери от касания.
             leafBody.maxDepenetrationVelocity = leafMaxDepenetration;
+        }
+
+        // Длина полотна для геометрической проверки «линии полотна» в
+        // призрачном режиме: центр масс лежит посередине створки.
+        if (leafBody != null && hinge != null)
+        {
+            Vector3 pivot = transform.TransformPoint(hinge.anchor);
+            leafLength = Vector3.Distance(leafBody.worldCenterOfMass, pivot) * 2f;
         }
 
         doorCenter = ComputeDoorCenter();
@@ -205,28 +200,281 @@ public class CustomerDoorOpener : MonoBehaviour
             }
         }
 
-        // Аварийный пропуск: гость уже в проёме, а створка всё ещё почти
-        // закрыта. Нормальная физика до этого не доводит — ассист открывает
-        // дверь раньше; срабатывание здесь означает сбой (спавн в проёме и т.п.).
-        bool shouldEmergencyPass = emergencyPassEnabled &&
-                                   nearestGuestDistance <= emergencyPassRadius &&
-                                   IsDoorAlmostClosed();
-
-        if (shouldEmergencyPass != emergencyPass)
-        {
-            emergencyPass = shouldEmergencyPass;
-            SetLeafCollidersEnabled(!emergencyPass);
-        }
+        // Призрачный режим: аварийный радиус (гость в проёме при закрытой
+        // створке) либо долгий контакт (клиент упирается дольше нормы).
+        UpdateGhostPass(nearestGuestDistance);
     }
 
     private void FixedUpdate()
     {
+        DecayStuckTimers();
+
         if (!guestNear || leafBody == null || leafBody.isKinematic)
         {
             return;
         }
 
         ApplyOpeningTorque();
+    }
+
+    /// <summary>
+    /// Сброс таймеров контакта: кто не прижимался к полотну на последнем
+    /// физическом шаге — тот ушёл, его накопленное время обнуляется.
+    /// «Долго упирается» значит именно НЕПРЕРЫВНО, поэтому никаких
+    /// накапливающихся «суммарных касаний» тут нет.
+    /// </summary>
+    private void DecayStuckTimers()
+    {
+        if (emergencyPass)
+        {
+            // Пока полотно призрачное, контактов нет — таймеры уже обнулены.
+            stepTouches.Clear();
+            return;
+        }
+
+        foreach (KeyValuePair<Rigidbody, float> timer in pushTimers)
+        {
+            if (!stepTouches.Contains(timer.Key))
+            {
+                pushTimers[timer.Key] = 0f;
+            }
+        }
+
+        stepTouches.Clear();
+    }
+
+    /// <summary>
+    /// Учёт контакта полотна с гостями: капсула гостя давит на створку,
+    /// но пройти не может — копим время. Работает и с кинематическими,
+    /// и с динамическими капсулами гостей (колбэки идут по Rigidbody полотна).
+    /// </summary>
+    private void OnCollisionStay(Collision collision)
+    {
+        if (emergencyPass || pushTimeToGhost <= 0f)
+        {
+            return;
+        }
+
+        Rigidbody body = collision.rigidbody;
+
+        if (body == null || body == leafBody)
+        {
+            return;
+        }
+
+        if (!IsCustomerCollider(collision.collider))
+        {
+            return;
+        }
+
+#if UNITY_6000_0_OR_NEWER
+        float speed = body.linearVelocity.magnitude;
+#else
+        float speed = body.velocity.magnitude;
+#endif
+        // Гость, который реально идёт своим путём, контакта почти не имеет.
+        // Застрявший стоит на месте. Быстрые тела в копилку не идут.
+        if (speed > stuckSpeedThreshold)
+        {
+            return;
+        }
+
+        // Полотно может состоять из нескольких коллайдеров — за один
+        // физический шаг колбэк придёт по паре на каждый коллайдер.
+        // Время контакта копим один раз на гостя.
+        if (!stepTouches.Add(body))
+        {
+            return;
+        }
+
+        float current;
+        pushTimers.TryGetValue(body, out current);
+        pushTimers[body] = current + Time.fixedDeltaTime;
+    }
+
+    /// <summary>
+    /// Принадлежит ли коллайдер одному из живых гостей. Гости берутся из
+    /// CustomerManager — как и во всех остальных проверках этого скрипта.
+    /// </summary>
+    private bool IsCustomerCollider(Collider other)
+    {
+        if (other == null)
+        {
+            return false;
+        }
+
+        Transform otherTransform = other.transform;
+
+        if (CustomerManager.Instance != null)
+        {
+            foreach (CustomerAI customer in CustomerManager.Instance.GetCustomers())
+            {
+                if (customer != null && otherTransform.IsChildOf(customer.transform))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // Тестовый стенд без CustomerManager: ищем CustomerAI в родителях.
+        return otherTransform.GetComponentInParent<CustomerAI>() != null;
+    }
+
+    /// <summary>
+    /// Призрачный режим полотна: коллайдер выключен, пока через проём
+    /// кто-то проходит; возвращается, когда «линию полотна» никто не касается.
+    ///
+    /// Две причины включить:
+    /// 1) АВАРИЯ (как в v2): гость в emergencyPassRadius от центра проёма,
+    ///    а створка всё ещё почти закрыта.
+    /// 2) ДОЛГИЙ КОНТАКТ (v2.1): клиент непрерывно упирается в полотно
+    ///    дольше pushTimeToGhost секунд — створка наполовину открыта поперёк
+    ///    прохода, гостя подпирает очередь, полотно зажато с двух сторон и т.п.
+    ///
+    /// Возврат коллайдера — только когда минимум ghostMinTime прошло И никто
+    /// из гостей не подходит к линии полотна ближе leafClearRadius. После
+    /// возврата держится пауза ghostCooldown против мерцания.
+    /// </summary>
+    private void UpdateGhostPass(float nearestGuestDistance)
+    {
+        if (emergencyPass)
+        {
+            if (Time.time - ghostedAt < ghostMinTime || AnyGuestTouchesLeafLine())
+            {
+                return;
+            }
+
+            emergencyPass = false;
+            ghostCooldownUntil = Time.time + ghostCooldown;
+            SetLeafCollidersEnabled(true);
+
+            if (debugLogs || ghostDebugLogs)
+            {
+                Debug.Log(ghostByStuck
+                    ? "[CustomerDoorOpener] Проём свободен — коллайдер полотна включён обратно."
+                    : "[CustomerDoorOpener] Аварийный пропуск завершён — коллайдер полотна включён обратно.");
+            }
+
+            ghostByStuck = false;
+            return;
+        }
+
+        float maxPushTime = 0f;
+
+        foreach (KeyValuePair<Rigidbody, float> timer in pushTimers)
+        {
+            if (timer.Value > maxPushTime)
+            {
+                maxPushTime = timer.Value;
+            }
+        }
+
+        bool emergencyCondition = emergencyPassEnabled &&
+                                  nearestGuestDistance <= emergencyPassRadius &&
+                                  IsDoorAlmostClosed();
+        bool stuckCondition = pushTimeToGhost > 0f && maxPushTime >= pushTimeToGhost;
+
+        if ((!emergencyCondition && !stuckCondition) || Time.time < ghostCooldownUntil)
+        {
+            return;
+        }
+
+        emergencyPass = true;
+        ghostByStuck = stuckCondition;
+        ghostedAt = Time.time;
+        pushTimers.Clear();
+        stepTouches.Clear();
+        SetLeafCollidersEnabled(false);
+
+        if (debugLogs || ghostDebugLogs)
+        {
+            Debug.Log(ghostByStuck
+                ? $"[CustomerDoorOpener] Клиент {maxPushTime:F1} сек упирался в дверь — дверь стала призрачной."
+                : "[CustomerDoorOpener] Гость в проёме при закрытой створке — аварийный пропуск.");
+        }
+    }
+
+    /// <summary>
+    /// Касается ли кто-то из гостей «линии полотна» (отрезок от петли длиной
+    /// leafLength, с запасом leafClearRadius). Геометрическая проверка —
+    /// работает и при выключенных коллайдерах, когда физика контактов молчит.
+    /// </summary>
+    private bool AnyGuestTouchesLeafLine()
+    {
+        if (hinge == null || leafLength <= 0f)
+        {
+            return false;
+        }
+
+        Vector3 pivot = transform.TransformPoint(hinge.anchor);
+        Vector3 axisWorld = transform.TransformDirection(hinge.axis).normalized;
+
+        // Направление полотна: проекция вектора «петля → центр масс»
+        // на плоскость, перпендикулярную оси петли.
+        Vector3 leafDirection = leafBody != null
+            ? leafBody.worldCenterOfMass - pivot
+            : transform.right;
+
+        leafDirection -= Vector3.Dot(leafDirection, axisWorld) * axisWorld;
+
+        if (leafDirection.sqrMagnitude < 0.0001f)
+        {
+            return false;
+        }
+
+        leafDirection.Normalize();
+
+        float clearSqr = leafClearRadius * leafClearRadius;
+
+        if (CustomerManager.Instance != null)
+        {
+            foreach (CustomerAI customer in CustomerManager.Instance.GetCustomers())
+            {
+                if (customer != null &&
+                    GuestCrossesLeafLine(customer.transform.position, pivot, leafDirection, clearSqr))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        CustomerAI[] sceneGuests = FindObjectsByType<CustomerAI>(FindObjectsSortMode.None);
+
+        foreach (CustomerAI customer in sceneGuests)
+        {
+            if (customer != null &&
+                GuestCrossesLeafLine(customer.transform.position, pivot, leafDirection, clearSqr))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Точка гостя в пределах leafClearRadius от отрезка полотна?
+    /// Проверка горизонтальная (высота игнорируется) — капсула гостя и
+    /// створка пересекаются по высоте всегда.
+    /// </summary>
+    private bool GuestCrossesLeafLine(Vector3 guestPosition, Vector3 pivot, Vector3 leafDirection, float clearSqr)
+    {
+        Vector3 toGuest = guestPosition - pivot;
+        float alongLeaf = Vector3.Dot(toGuest, leafDirection);
+
+        // Гость заведомо за краем полотна (с запасом) — проходу не мешает.
+        if (alongLeaf < -leafClearRadius || alongLeaf > leafLength + leafClearRadius)
+        {
+            return false;
+        }
+
+        Vector3 closestPoint = pivot + leafDirection * Mathf.Clamp(alongLeaf, 0f, leafLength);
+
+        return HorizontalSqrDistance(closestPoint, guestPosition) <= clearSqr;
     }
 
     /// <summary>
@@ -505,5 +753,26 @@ public class CustomerDoorOpener : MonoBehaviour
         // Красный — радиус аварийного пропуска.
         Gizmos.color = new Color(1f, 0.25f, 0.15f, 0.8f);
         Gizmos.DrawWireSphere(center, Mathf.Max(emergencyPassRadius, 0.1f));
+
+        // Голубая линия — «линия полотна»: пока её касается кто-то из гостей,
+        // призрачный режим не выключается.
+        if (Application.isPlaying && hinge != null)
+        {
+            Vector3 pivot = transform.TransformPoint(hinge.anchor);
+            Vector3 axisWorld = transform.TransformDirection(hinge.axis).normalized;
+            Vector3 leafDirection = leafBody != null
+                ? leafBody.worldCenterOfMass - pivot
+                : transform.right;
+            leafDirection -= Vector3.Dot(leafDirection, axisWorld) * axisWorld;
+
+            if (leafDirection.sqrMagnitude > 0.0001f)
+            {
+                leafDirection.Normalize();
+                Vector3 tip = pivot + leafDirection * Mathf.Max(leafLength, pushAssistRadius);
+
+                Gizmos.color = new Color(0.2f, 0.9f, 1f, 0.8f);
+                Gizmos.DrawLine(pivot, tip);
+            }
+        }
     }
 }

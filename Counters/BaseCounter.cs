@@ -4,6 +4,10 @@ using System.Collections.Generic;
 
 public class BaseCounter : MonoBehaviour, IKitchenObjectParent
 {
+    // ★ v1.1: одноразовый Warning на весь домен — если сетки нет в сцене,
+    // каждый счётчик не будет сыпать одинаковыми сообщениями.
+    private static bool gridMissingWarned = false;
+
     [SerializeField] private Transform counterTopPoint;
 
     private KitchenObject kitchenObject;
@@ -12,9 +16,24 @@ public class BaseCounter : MonoBehaviour, IKitchenObjectParent
     {
         // Каждому столу при рождении/старте игры даем команду выровняться по сетке и зарегистрироваться.
         // Это сработает автоматически для всех наследников (StoveCounter, CuttingCounter, DiningTable и т.д.)
-        if (GridPositioningSystem.Instance != null)
+        //
+        // ★ v1.1: раньше здесь читался только GridPositioningSystem.Instance — если объект
+        // сетки случайно отключали/удаляли при правке сцены, ВСЕ счётчики молча пропускали
+        // регистрацию, и «автоматическая постановка в клетку» умирала без единой ошибки.
+        // Теперь сетка восстанавливается лениво (ResolveInstance), а если её нет совсем —
+        // падает ОДИН явный Warning с инструкцией.
+        if (GridPositioningSystem.ResolveInstance() != null)
         {
             GridPositioningSystem.Instance.RegisterCounterAtCurrentPosition(this);
+        }
+        else if (!gridMissingWarned)
+        {
+            gridMissingWarned = true;
+
+            Debug.LogWarning(
+                "[GridSystem] BaseCounter: GridPositioningSystem не найден — автопостановка " +
+                "в клетку отключена для ВСЕЙ мебели. Создай в игровой сцене пустой объект " +
+                "с компонентом GridPositioningSystem (см. чеклист).");
         }
     }
 
@@ -41,7 +60,7 @@ public class BaseCounter : MonoBehaviour, IKitchenObjectParent
     {
         return counterTopPoint;
     }
-    
+
     public void SetKitchenObject(KitchenObject kitchenObject)
     {
         this.kitchenObject = kitchenObject;

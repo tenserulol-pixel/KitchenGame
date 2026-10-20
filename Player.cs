@@ -1,5 +1,6 @@
 using UnityEngine;
 using System;
+using System.Collections.Generic;
 
 public class Player : MonoBehaviour, IKitchenObjectParent
 {
@@ -37,6 +38,12 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     [Tooltip("Сколько секунд после нажатия кнопка 'ждёт' появления валидной станции")]
     [SerializeField] private float interactBufferDuration = 0.2f;
 
+    [Header("Блокировка выбора станций за стенами")]
+    [Tooltip("Высота горизонтального луча проверки обзора над полом (грудь игрока, м). Луч не должен пересекать чужие коллайдеры — иначе станция за стеной не выбирается и притяжение не тащит сквозь стену.")]
+    [SerializeField] private float sightHeight = 0.9f;
+    [Tooltip("Рисовать в Scene-виде луч проверки обзора (зелёный = чисто, красный = закрыт) и логировать в Console, что именно закрывает обзор. Выключи, когда убедишься, что всё работает.")]
+    [SerializeField] private bool debugSightLine = true;
+
     [Header("Точка удержания предметов")]
     [SerializeField] private Transform kitchenObjectHoldPoint;
 
@@ -44,6 +51,12 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     private Vector3 lastInteractDir;
     private BaseCounter selectedCounter;
     private KitchenObject kitchenObject;
+
+    // Все коллайдеры игрока (включая дочерние) — исключаются из проверки обзора.
+    private HashSet<Collider> playerColliders;
+
+    // Буфер для RaycastNonAlloc в проверке обзора (без аллокаций каждый кадр).
+    private readonly RaycastHit[] obstructionHits = new RaycastHit[16];
 
     // -1 значит "буфер неактивен"; иначе — момент времени (Time.time), до которого
     // ожидающее нажатие ещё считается актуальным
@@ -62,6 +75,8 @@ public class Player : MonoBehaviour, IKitchenObjectParent
             Destroy(gameObject);
             return;
         }
+
+        playerColliders = new HashSet<Collider>(GetComponentsInChildren<Collider>(true));
     }
 
     private void Start()
@@ -79,18 +94,6 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         // Если в данный момент не идет активная игра (например, идет отсчет или подведение итогов),
         // полностью блокируем передвижение персонажа и выбор столов.
         if (GameLoopManager.Instance != null && !GameLoopManager.Instance.IsGamePlaying() && !GameLoopManager.Instance.IsPreparationActive())
-        {
-            isWalking = false;
-            SetSelectedCounter(null);
-            return;
-        }
-
-        // Черновик карт (гримуар открыт): полная заморозка игрока. ЭТО ГЛАВНЫЙ
-        // БЛОКИРОВЩИК — Action Map "Player" остаётся включённой, потому что A/D и E
-        // (действия Move и Interact) нужны самому черновику для навигации по гримуару.
-        // Гейт глушит: ходьбу, луч выбора станции, автопритяжение (HandleCounterSnap),
-        // буферизованные нажатия E/F и передачу зажатия F станциям.
-        if (UpgradeManager.Instance != null && UpgradeManager.Instance.IsDraftActive)
         {
             isWalking = false;
             SetSelectedCounter(null);
@@ -121,11 +124,6 @@ public class Player : MonoBehaviour, IKitchenObjectParent
             else if (selectedCounter is Puddle puddle)
             {
                 puddle.SetCleaningState(isHeld);
-            }
-            // Для котла (перемешивание зажатием F)
-            else if (selectedCounter is StoveCounter stoveCounter)
-            {
-                stoveCounter.SetStirringState(isHeld);
             }
             // Для других столов, поддерживающих удержание, добавляйте аналогично
         }
@@ -240,7 +238,12 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         // Пускаем луч (Raycast) вперед, чтобы найти интерактивный стол на слое Counters
         if (Physics.Raycast(transform.position, lastInteractDir, out RaycastHit raycastHit, interactDistance, countersLayerMask))
         {
-            if (raycastHit.transform.TryGetComponent<BaseCounter>(out BaseCounter baseCounter))
+            // Луч по слою Counters СТЕН НЕ ВИДИТ — они на других слоях. Без проверки
+            // обзора станция за стеной выбиралась, а HandleCounterSnap() тащил игрока
+            // к ней прямо сквозь стену. Чужой коллайдер на линии «игрок → станция» —
+            // выбор отменяется.
+            if (raycastHit.transform.TryGetComponent<BaseCounter>(out BaseCounter baseCounter) &&
+                !IsCounterHiddenBehindObstacle(baseCounter, raycastHit.collider, raycastHit.point))
             {
                 if (baseCounter != selectedCounter)
                 {
@@ -256,6 +259,86 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         {
             SetSelectedCounter(null);
         }
+    }
+
+    /// <summary>
+    /// Есть ли между игроком и станцией чужой коллайдер (стена, мебель, пропс).
+    ///
+    /// Луч проверки — ГОРИЗОНТАЛЬНЫЙ на высоте груди (sightHeight), а не
+    /// диагональный до точки попадания у пола: диагональ цепляла за пол,
+    /// порожки и прочую околоземную геометрию и ложно блокировала валидные
+    /// станции — игрок «переставал видеть» станцию вплотную к ней.
+    /// Высота зажимается в пределы коллайдера станции: луч гарантированно
+    /// заканчивается на её поверхности и не перелетает к стене позади неё.
+    /// Триггеры, коллайдеры игрока, самой станции и несомого предмета —
+    /// препятствиями не считаются.
+    /// </summary>
+    private bool IsCounterHiddenBehindObstacle(BaseCounter counter, Collider counterCollider, Vector3 counterPoint)
+    {
+        float checkHeight = sightHeight;
+
+        if (counterCollider != null)
+        {
+            Bounds stationBounds = counterCollider.bounds;
+
+            // Не выше макушки станции (иначе луч перелетит её к стене позади)
+            // и не ниже 15 см над её нижней гранью (не цепляем пол/порожки).
+            float minHeight = stationBounds.min.y + 0.15f;
+            float maxHeight = Mathf.Max(minHeight, stationBounds.max.y - 0.05f);
+            checkHeight = Mathf.Clamp(sightHeight, minHeight, maxHeight);
+        }
+
+        Vector3 from = new Vector3(transform.position.x, checkHeight, transform.position.z);
+        Vector3 target = new Vector3(counterPoint.x, checkHeight, counterPoint.z);
+        Vector3 toTarget = target - from;
+        float sightDistance = toTarget.magnitude;
+
+        // Точка попадания практически в самом игроке — проверять нечего.
+        if (sightDistance < 0.01f)
+        {
+            return false;
+        }
+
+        // Линия «игрок → станция» = обычный RaycastNonAlloc на дистанцию до
+        // станции. (Physics.LinecastNonAlloc в Unity нет — только Raycast-,
+        // Sphere- и т.д. NonAlloc, поэтому используем его: совместимо со всеми
+        // версиями и не аллоцирует.)
+        int hitCount = Physics.RaycastNonAlloc(
+            from,
+            toTarget / sightDistance,
+            obstructionHits,
+            sightDistance,
+            Physics.DefaultRaycastLayers,
+            QueryTriggerInteraction.Ignore);
+
+        bool occluded = false;
+
+        for (int i = 0; i < hitCount; i++)
+        {
+            Collider hit = obstructionHits[i].collider;
+
+            if (hit == null) continue;
+            if (hit.transform.IsChildOf(counter.transform)) continue;   // сама станция
+            if (playerColliders.Contains(hit)) continue;                // тело игрока
+            if (kitchenObject != null &&
+                hit.transform.IsChildOf(kitchenObject.transform)) continue; // несомый предмет
+
+            if (debugSightLine)
+            {
+                Debug.Log($"[Player] Обзор закрыт: '{hit.name}' " +
+                          $"({hit.gameObject.layer}) между игроком и '{counter.name}'.");
+            }
+
+            occluded = true;
+            break;
+        }
+
+        if (debugSightLine)
+        {
+            Debug.DrawLine(from, target, occluded ? Color.red : Color.green);
+        }
+
+        return occluded;
     }
 
     /// <summary>
@@ -314,7 +397,34 @@ public class Player : MonoBehaviour, IKitchenObjectParent
 
         idealPosition.y = transform.position.y; // высоту не трогаем
 
-        transform.position = Vector3.MoveTowards(transform.position, idealPosition, snapMoveSpeed * Time.deltaTime);
+        // Страховка №2: даже если выбор каким-то образом просочился за препятствие,
+        // притяжение не имеет права продавливать геометрию. Тот же капсульный каст,
+        // что и в обычном движении: упёрлись — останавливаемся вплотную, сквозь
+        // стену игрока больше не тащит никогда.
+        Vector3 targetPosition = Vector3.MoveTowards(transform.position, idealPosition, snapMoveSpeed * Time.deltaTime);
+        Vector3 snapStep = targetPosition - transform.position;
+
+        if (snapStep.sqrMagnitude > 0.000001f)
+        {
+            Vector3 snapDir = snapStep.normalized;
+            float snapDistance = snapStep.magnitude;
+
+            if (Physics.CapsuleCast(
+                transform.position,
+                transform.position + Vector3.up * playerHeight,
+                playerRadius,
+                snapDir,
+                out RaycastHit snapHit,
+                snapDistance,
+                Physics.DefaultRaycastLayers,
+                QueryTriggerInteraction.Ignore))
+            {
+                float allowedDistance = Mathf.Max(0f, snapHit.distance - 0.02f);
+                targetPosition = transform.position + snapDir * allowedDistance;
+            }
+        }
+
+        transform.position = targetPosition;
 
         Vector3 lookDir = counterCenter - transform.position;
         lookDir.y = 0f;
@@ -369,12 +479,6 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         if (GameLoopManager.Instance != null && !GameLoopManager.Instance.IsGamePlaying() && !GameLoopManager.Instance.IsPreparationActive())
             return;
 
-        // Черновик карт: во время гримуара E занята подтверждением выбора карты —
-        // это нажатие забирает UpgradeManager (подписан на то же событие), а здесь
-        // взаимодействие со столами не срабатывает и в буфер не попадает.
-        if (UpgradeManager.Instance != null && UpgradeManager.Instance.IsDraftActive)
-            return;
-
         if (selectedCounter != null)
         {
             selectedCounter.Interact(this);
@@ -394,10 +498,6 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     private void GameInput_OnInteractAlternateAction(object sender, EventArgs e)
     {
         if (GameLoopManager.Instance != null && !GameLoopManager.Instance.IsGamePlaying() && !GameLoopManager.Instance.IsPreparationActive())
-            return;
-
-        // Черновик карт: F не работает, пока открыт гримуар (см. комментарий выше).
-        if (UpgradeManager.Instance != null && UpgradeManager.Instance.IsDraftActive)
             return;
 
         if (selectedCounter != null)
