@@ -1,6 +1,25 @@
 using UnityEngine;
 using System;
 
+/// <summary>
+/// ★ v2 (БАГФИКС-ПРОХОД) — СЛИЯНИЕ ДВУХ ВЕТОК ЭТОГО ФАЙЛА.
+///
+/// Предыдущий деливерабл (download/grid/GameLoopManager.cs) был собран на старой базе
+/// и терял важные методы v7, из-за чего проект с ShopManager v1.3+/FurnitureMovingController
+/// v2.3/UpgradeManager (карты) НЕ КОМПИЛИРОВАЛСЯ. Эта версия содержит ВСЁ:
+///
+/// - База v7: PushUiInputLock/PopUiInputLock/IsUiInputLocked (модальные экраны),
+///   гейт Enter поверх модальных экранов, гейт черновика карт в StartCountdown,
+///   DecreaseAngryCustomerTolerance (Патч 2, карта «Тёмная сделка» — без него DarkDeal
+///   из card_ui/UpgradeManager.cs не компилируется и работает инвертированно).
+/// - Ветка сетки (grid-save): применение сохранённой расстановки мебели через кадр
+///   после старта сцены (FurnitureSaveUtility.ApplySavedLayout) и заполнение
+///   placedObjects при сохранении (FurnitureSaveUtility.CollectPlacedObjects).
+/// - НОВОЕ (багфикс): сохранение и восстановление счётчиков покупок магазина
+///   (purchaseCounts). Раньше они вообще не сохранялись — после «Продолжить» лимитные
+///   товары (maxPurchaseCount) можно было покупать заново, а RestorePurchaseCounts
+///   оставался мёртвым кодом.
+/// </summary>
 public class GameLoopManager : MonoBehaviour
 {
     // Одиночка (Singleton) для легкого доступа из любой части кода (UI, спавнеры, игроки)
@@ -43,6 +62,14 @@ public class GameLoopManager : MonoBehaviour
 
     private int successfulDeliveriesToday = 0; // Успешных заказов за сегодня
     private int failedDeliveriesToday = 0; // Сгоревших/проваленных заказов за сегодня
+
+    // === Система блокировки ввода под модальные экраны (счётчик, а не bool) ===
+    // Гримуар карт и любые будущие модальные экраны (магазин, пауза) pus'ят блокировку
+    // на время своей жизни и pop'ают при закрытии. Именно СЧЁТЧИК: если один экран
+    // открыт поверх другого, закрытие нижнего не снимет защиту верхнего.
+    // Потребители: FurnitureMovingController.Update (перенос мебели замирает),
+    // гейт Enter в DayPreparation ниже (день нельзя начать поверх экрана).
+    private int uiInputLockCount = 0;
 
     // События для обновления золота и очков в UI
     public event EventHandler<OnGoldChangedEventArgs> OnGoldChanged;
@@ -99,17 +126,22 @@ public class GameLoopManager : MonoBehaviour
     {
         ResetDayStats();
 
-        // ★ v1.1 (сохранение расстановки мебели): применяем сохранённую расстановку
-        // ЧЕРЕЗ ОДИН КАДР после старта сцены. Почему так:
+        // ★ v2 (ветка сетки): применяем сохранённую расстановку мебели ЧЕРЕЗ ОДИН КАДР
+        // после старта сцены. Почему так:
         // - все BaseCounter.Awake уже отработали и зарегистрировались в сетке;
         // - StartingLayoutRandomizer тоже успел уводить прилавки в резерв (его Start) —
         //   и на ПРОДОЛЖЕНИИ игры сохранённая расстановка побеждает случайную;
         // - на НОВОЙ игре (сохранения нет) ApplySavedLayout просто ничего не делает.
         StartCoroutine(ApplySavedFurnitureLayoutNextFrame());
+
+        // ★ v2 (багфикс): восстанавливаем счётчики покупок магазина из сейва.
+        // Внутри RestorePurchaseCounts также повторно применяются эффекты всех
+        // купленных апгрейдов («Очищенная вода», «Вечный огонь» и т.д.).
+        RestoreShopStateFromSave();
     }
 
     /// <summary>
-    /// ★ v1.1: задержка на один кадр перед применением сохранённой расстановки —
+    /// ★ v2: задержка на один кадр перед применением сохранённой расстановки —
     /// см. комментарий в Start(). Сама логика — в FurnitureSaveUtility.ApplySavedLayout().
     /// </summary>
     private System.Collections.IEnumerator ApplySavedFurnitureLayoutNextFrame()
@@ -118,13 +150,34 @@ public class GameLoopManager : MonoBehaviour
         FurnitureSaveUtility.ApplySavedLayout();
     }
 
+    /// <summary>
+    /// ★ v2 (багфикс): восстанавливает счётчики покупок магазина из сохранения.
+    /// Раньше RestorePurchaseCounts существовал, но никто его не вызывал (мёртвый код):
+    /// после «Продолжить» лимиты maxPurchaseCount сбрасывались, и ограниченные товары
+    /// можно было покупать заново.
+    /// </summary>
+    private void RestoreShopStateFromSave()
+    {
+        if (SaveManager.Instance == null || !SaveManager.Instance.HasSave()) return;
+
+        GameSaveData save = SaveManager.Instance.GetCurrentSave();
+        if (save == null) return;
+
+        if (ShopManager.Instance != null)
+        {
+            ShopManager.Instance.RestorePurchaseCounts(save.purchaseCounts);
+        }
+    }
+
     private void Update()
     {
         switch (state)
         {
             case State.DayPreparation:
-                // В режиме подготовки игрок может нажать ENTER или специальную кнопку, чтобы начать рабочий день
-                if (Input.GetKeyDown(KeyCode.Return))
+                // Enter стартует день, но НЕ поверх модального экрана (гримуар, магазин
+                // и любые будущие PushUiInputLock-экраны): иначе день начался бы,
+                // пока игрок ещё выбирает карту или покупает мебель.
+                if (Input.GetKeyDown(KeyCode.Return) && !IsUiInputLocked)
                 {
                     StartCountdown();
                 }
@@ -179,12 +232,45 @@ public class GameLoopManager : MonoBehaviour
         }
     }
 
+    // ===== API блокировки ввода под модальные экраны =====
+
+    /// <summary>
+    /// Модальный экран открылся — «прижать» ввод игрока. Каждому Push обязан
+    /// соответствовать ровно один Pop (при закрытии экрана / в OnDestroy).
+    /// Вложенность безопасна: счётчик снимется только когда закроются ВСЕ экраны.
+    /// </summary>
+    public void PushUiInputLock() => uiInputLockCount++;
+
+    /// <summary>
+    /// Модальный экран закрылся — отпустить ввод. Пол по нулю: лишний/двойной Pop
+    /// не уведёт счётчик в минус (иначе одна ошибка навсегда заблокировала бы ввод).
+    /// </summary>
+    public void PopUiInputLock() => uiInputLockCount = Mathf.Max(0, uiInputLockCount - 1);
+
+    /// <summary>
+    /// True, пока хоть один модальный экран держит блокировку.
+    /// Читается FurnitureMovingController (перенос мебели замирает) и гейтом Enter выше.
+    /// </summary>
+    public bool IsUiInputLocked => uiInputLockCount > 0;
+
     /// <summary>
     /// Запуск обратного отсчета для начала рабочего дня.
     /// </summary>
     public void StartCountdown()
     {
         if (state != State.DayPreparation) return;
+
+        // Черновик карт обязан быть закрыт до старта дня: гримуар — модальный экран,
+        // персонаж заморожен гейтом в Player.cs. Если бы день начался при открытом
+        // черновике, карты «провисли» бы до следующего дня (страховка-автоскип в
+        // UpgradeManager всё же закрыла бы их, но игрок потерял бы выбор).
+        // Путь навигации: A/D — подсветка, E — взять; или мышь; или Escape — пропустить.
+        if (UpgradeManager.Instance != null && UpgradeManager.Instance.IsDraftActive)
+        {
+            Debug.Log("[GameLoop] Сначала выбери карту улучшения: A/D — листать, E — взять " +
+                      "(или мышкой), Escape — пропустить.");
+            return;
+        }
 
         countdownToStartTimer = countdownToStartTimerMax;
         state = State.CountdownToStart;
@@ -222,8 +308,10 @@ public class GameLoopManager : MonoBehaviour
     /// - при выходе в главное меню через QuitToMainMenu(saveProgress: true)
     /// - при покупке в магазине (ShopManager.FinalizePurchase / CompletePendingPurchase)
     ///
-    /// ★ v1.1: теперь заполняется и placedObjects — снимок расстановки мебели
-    /// собирает FurnitureSaveUtility прямо с реестра занятых ячеек сетки.
+    /// ★ v2: заполняется и placedObjects — снимок расстановки мебели собирает
+    /// FurnitureSaveUtility прямо с реестра занятых ячеек сетки; и purchaseCounts —
+    /// сколько раз куплен каждый товар магазина (лимиты maxPurchaseCount переживают
+    /// перезапуск).
     /// </summary>
     public void SaveCurrentProgress()
     {
@@ -242,9 +330,14 @@ public class GameLoopManager : MonoBehaviour
             // публичный GetOwnedCardNames(). Сейчас список останется пустым,
             // что приемлемо для базового цикла игры.
             ownedUpgradeCardNames = new System.Collections.Generic.List<string>(),
-            // ★ v1.1: расстановка мебели — вся зарегистрированная в сетке
+            // ★ v2: расстановка мебели — вся зарегистрированная в сетке
             // (и авторская, и купленная), с позициями, поворотами и itemId.
-            placedObjects = FurnitureSaveUtility.CollectPlacedObjects()
+            placedObjects = FurnitureSaveUtility.CollectPlacedObjects(),
+            // ★ v2 (багфикс): счётчики покупок магазина — лимиты и эффекты апгрейдов
+            // переживают «Продолжить».
+            purchaseCounts = ShopManager.Instance != null
+                ? ShopManager.Instance.GetPurchaseCountsForSave()
+                : new System.Collections.Generic.List<PurchaseCountSaveData>()
         };
 
         SaveManager.Instance.Save(data);
@@ -365,6 +458,13 @@ public class GameLoopManager : MonoBehaviour
 
     // Для UpgradeManager — карта "терпимость к недовольным" поднимает порог поражения.
     public void IncreaseAngryCustomerTolerance(int amount) => maxAngryCustomersPerDay += amount;
+
+    // Для карты "Тёмная сделка" (Патч 2) — снижает порог поражения, но не ниже 1:
+    // порог 0 означал бы мгновенное поражение от первого же недовольного клиента.
+    // ★ v2: метод обязателен — card_ui/UpgradeManager.cs (DarkDeal) вызывает его,
+    // без него проект не компилируется.
+    public void DecreaseAngryCustomerTolerance(int amount) =>
+        maxAngryCustomersPerDay = Mathf.Max(1, maxAngryCustomersPerDay - amount);
 
     // Для карты "Мягкая рука" — снижает штраф за проваленный заказ, не ниже нуля
     // (отрицательный штраф означал бы получать деньги за провал, что не имеет смысла).

@@ -1,6 +1,5 @@
 using UnityEngine;
 using System;
-using System.Collections.Generic;
 
 public class Player : MonoBehaviour, IKitchenObjectParent
 {
@@ -38,12 +37,6 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     [Tooltip("Сколько секунд после нажатия кнопка 'ждёт' появления валидной станции")]
     [SerializeField] private float interactBufferDuration = 0.2f;
 
-    [Header("Блокировка выбора станций за стенами")]
-    [Tooltip("Высота горизонтального луча проверки обзора над полом (грудь игрока, м). Луч не должен пересекать чужие коллайдеры — иначе станция за стеной не выбирается и притяжение не тащит сквозь стену.")]
-    [SerializeField] private float sightHeight = 0.9f;
-    [Tooltip("Рисовать в Scene-виде луч проверки обзора (зелёный = чисто, красный = закрыт) и логировать в Console, что именно закрывает обзор. Выключи, когда убедишься, что всё работает.")]
-    [SerializeField] private bool debugSightLine = true;
-
     [Header("Точка удержания предметов")]
     [SerializeField] private Transform kitchenObjectHoldPoint;
 
@@ -52,16 +45,18 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     private BaseCounter selectedCounter;
     private KitchenObject kitchenObject;
 
-    // Все коллайдеры игрока (включая дочерние) — исключаются из проверки обзора.
-    private HashSet<Collider> playerColliders;
-
-    // Буфер для RaycastNonAlloc в проверке обзора (без аллокаций каждый кадр).
-    private readonly RaycastHit[] obstructionHits = new RaycastHit[16];
-
     // -1 значит "буфер неактивен"; иначе — момент времени (Time.time), до которого
     // ожидающее нажатие ещё считается актуальным
     private float interactBufferExpireTime = -1f;
     private float interactAlternateBufferExpireTime = -1f;
+
+    // ★ ФИКС (залипание hold-действий): последняя станция, которой мы передали
+    // "кнопка зажата" (резка/мойка/уборка/перемешивание). Раньше, когда игрок
+    // отходил от станции, selectedCounter обнулялся, и ветка передачи hold-состояния
+    // просто переставала выполняться — SetCuttingState(false) НИКОГДА не вызывался,
+    // и станция продолжала резать/мыть вечно. Теперь мы помним, кому последний раз
+    // передали hold-состояние, и при смене/потере цели гасим СТАРУЮ станцию.
+    private BaseCounter activeHoldCounter;
 
     private void Awake()
     {
@@ -75,8 +70,6 @@ public class Player : MonoBehaviour, IKitchenObjectParent
             Destroy(gameObject);
             return;
         }
-
-        playerColliders = new HashSet<Collider>(GetComponentsInChildren<Collider>(true));
     }
 
     private void Start()
@@ -89,6 +82,13 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         }
     }
 
+    // ★ ФИКС: при выгрузке сцены / уничтожении игрока станция не должна остаться
+    // в состоянии "держат F" до конца своего существования.
+    private void OnDisable()
+    {
+        ForceReleaseHold();
+    }
+
     private void Update()
     {
         // Если в данный момент не идет активная игра (например, идет отсчет или подведение итогов),
@@ -96,6 +96,20 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         if (GameLoopManager.Instance != null && !GameLoopManager.Instance.IsGamePlaying() && !GameLoopManager.Instance.IsPreparationActive())
         {
             isWalking = false;
+            ForceReleaseHold(); // ★ ФИКС: день закончился/начался отсчёт — гасим удержание
+            SetSelectedCounter(null);
+            return;
+        }
+
+        // Черновик карт (гримуар открыт): полная заморозка игрока. ЭТО ГЛАВНЫЙ
+        // БЛОКИРОВЩИК — Action Map "Player" остаётся включённой, потому что A/D и E
+        // (действия Move и Interact) нужны самому черновику для навигации по гримуару.
+        // Гейт глушит: ходьбу, луч выбора станции, автопритяжение (HandleCounterSnap),
+        // буферизованные нажатия E/F и передачу зажатия F станциям.
+        if (UpgradeManager.Instance != null && UpgradeManager.Instance.IsDraftActive)
+        {
+            isWalking = false;
+            ForceReleaseHold(); // ★ ФИКС: гримуар открылся посреди резки — гасим удержание
             SetSelectedCounter(null);
             return;
         }
@@ -106,27 +120,99 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         HandleBufferedInteractions();
 
         // ---------- Передача состояния удержания для длительных действий ----------
-        if (selectedCounter != null)
-        {
-            bool isHeld = GameInput.Instance != null && GameInput.Instance.IsInteractAlternatePressed();
+        // ★ ФИКС: вместо блока "if (selectedCounter != null) ..." — полный цикл
+        // обслуживания hold-состояния, включающий СБРОС при потере/смене цели.
+        UpdateHoldStates();
+    }
 
-            // Для разделочного стола
-            if (selectedCounter is CuttingCounter cuttingCounter)
-            {
-                cuttingCounter.SetCuttingState(isHeld);
-            }
-            // Для раковины
-            else if (selectedCounter is SinkCounter sinkCounter)
-            {
-                sinkCounter.SetWashingState(isHeld);
-            }
-            // Для лужи (уборка держанием F)
-            else if (selectedCounter is Puddle puddle)
-            {
-                puddle.SetCleaningState(isHeld);
-            }
-            // Для других столов, поддерживающих удержание, добавляйте аналогично
+    /// <summary>
+    /// ★ ФИКС (залипание hold-действий): каждый кадр определяет, какая станция сейчас
+    /// является целью удержания (selectedCounter, если она поддерживает hold-действия),
+    /// передаёт ей актуальное состояние кнопки F и гасит удержание на ПРЕЖНЕЙ станции,
+    /// если цель сменилась или исчезла (игрок отошёл, станция унесена/уничтожена).
+    /// </summary>
+    private void UpdateHoldStates()
+    {
+        bool isHeld = GameInput.Instance != null && GameInput.Instance.IsInteractAlternatePressed();
+
+        BaseCounter holdTarget = GetHoldTarget(selectedCounter);
+
+        // Цель сменилась (отошёл от станции, повернулся к другой, станция унесена
+        // FurnitureMovingController'ом) — старая станция обязана получить false,
+        // иначе её внутренний isCutting/isWashing/isBeingCleaned/isPlayerStirring
+        // останется true, и прогресс продолжит расти без игрока.
+        ReleaseStaleHold(holdTarget);
+
+        if (holdTarget != null)
+        {
+            ApplyHoldState(holdTarget, isHeld);
+            activeHoldCounter = holdTarget;
         }
+        else
+        {
+            activeHoldCounter = null;
+        }
+    }
+
+    /// <summary>Поддерживает ли эта станция hold-действия (зажатие F).</summary>
+    private static BaseCounter GetHoldTarget(BaseCounter counter)
+    {
+        if (counter is CuttingCounter || counter is SinkCounter ||
+            counter is Puddle || counter is StoveCounter)
+        {
+            return counter;
+        }
+        return null;
+    }
+
+    /// <summary>Передаёт станции актуальное hold-состояние, зная её тип.</summary>
+    private static void ApplyHoldState(BaseCounter target, bool isHeld)
+    {
+        switch (target)
+        {
+            case CuttingCounter cuttingCounter:
+                cuttingCounter.SetCuttingState(isHeld);
+                break;
+            case SinkCounter sinkCounter:
+                sinkCounter.SetWashingState(isHeld);
+                break;
+            case Puddle puddle:
+                puddle.SetCleaningState(isHeld);
+                break;
+            case StoveCounter stoveCounter:
+                stoveCounter.SetStirringState(isHeld);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Гасит удержание на прежней станции, если цель сменилась. Мёртвая ссылка
+    /// (объект уничтожен — Unity == null) обрабатывается безопасно: вызов метода
+    /// по уничтоженному объекту не выполняется.
+    /// </summary>
+    private void ReleaseStaleHold(BaseCounter currentTarget)
+    {
+        if (activeHoldCounter == null) return;          // ничего не держим (или уже уничтожено)
+        if (activeHoldCounter == currentTarget) return; // та же станция — состояние актуально
+
+        ApplyHoldState(activeHoldCounter, false);
+        activeHoldCounter = null;
+    }
+
+    /// <summary>
+    /// Принудительно гасит активное удержание — при смене фазы игры, открытии гримуара,
+    /// выключении/уничтожении игрока. Вызывается из ранних return'ов Update() и OnDisable.
+    /// </summary>
+    private void ForceReleaseHold()
+    {
+        if (activeHoldCounter == null)
+        {
+            activeHoldCounter = null; // уничтоженная ссылка — просто забываем её
+            return;
+        }
+
+        ApplyHoldState(activeHoldCounter, false);
+        activeHoldCounter = null;
     }
 
     /// <summary>
@@ -238,12 +324,7 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         // Пускаем луч (Raycast) вперед, чтобы найти интерактивный стол на слое Counters
         if (Physics.Raycast(transform.position, lastInteractDir, out RaycastHit raycastHit, interactDistance, countersLayerMask))
         {
-            // Луч по слою Counters СТЕН НЕ ВИДИТ — они на других слоях. Без проверки
-            // обзора станция за стеной выбиралась, а HandleCounterSnap() тащил игрока
-            // к ней прямо сквозь стену. Чужой коллайдер на линии «игрок → станция» —
-            // выбор отменяется.
-            if (raycastHit.transform.TryGetComponent<BaseCounter>(out BaseCounter baseCounter) &&
-                !IsCounterHiddenBehindObstacle(baseCounter, raycastHit.collider, raycastHit.point))
+            if (raycastHit.transform.TryGetComponent<BaseCounter>(out BaseCounter baseCounter))
             {
                 if (baseCounter != selectedCounter)
                 {
@@ -259,86 +340,6 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         {
             SetSelectedCounter(null);
         }
-    }
-
-    /// <summary>
-    /// Есть ли между игроком и станцией чужой коллайдер (стена, мебель, пропс).
-    ///
-    /// Луч проверки — ГОРИЗОНТАЛЬНЫЙ на высоте груди (sightHeight), а не
-    /// диагональный до точки попадания у пола: диагональ цепляла за пол,
-    /// порожки и прочую околоземную геометрию и ложно блокировала валидные
-    /// станции — игрок «переставал видеть» станцию вплотную к ней.
-    /// Высота зажимается в пределы коллайдера станции: луч гарантированно
-    /// заканчивается на её поверхности и не перелетает к стене позади неё.
-    /// Триггеры, коллайдеры игрока, самой станции и несомого предмета —
-    /// препятствиями не считаются.
-    /// </summary>
-    private bool IsCounterHiddenBehindObstacle(BaseCounter counter, Collider counterCollider, Vector3 counterPoint)
-    {
-        float checkHeight = sightHeight;
-
-        if (counterCollider != null)
-        {
-            Bounds stationBounds = counterCollider.bounds;
-
-            // Не выше макушки станции (иначе луч перелетит её к стене позади)
-            // и не ниже 15 см над её нижней гранью (не цепляем пол/порожки).
-            float minHeight = stationBounds.min.y + 0.15f;
-            float maxHeight = Mathf.Max(minHeight, stationBounds.max.y - 0.05f);
-            checkHeight = Mathf.Clamp(sightHeight, minHeight, maxHeight);
-        }
-
-        Vector3 from = new Vector3(transform.position.x, checkHeight, transform.position.z);
-        Vector3 target = new Vector3(counterPoint.x, checkHeight, counterPoint.z);
-        Vector3 toTarget = target - from;
-        float sightDistance = toTarget.magnitude;
-
-        // Точка попадания практически в самом игроке — проверять нечего.
-        if (sightDistance < 0.01f)
-        {
-            return false;
-        }
-
-        // Линия «игрок → станция» = обычный RaycastNonAlloc на дистанцию до
-        // станции. (Physics.LinecastNonAlloc в Unity нет — только Raycast-,
-        // Sphere- и т.д. NonAlloc, поэтому используем его: совместимо со всеми
-        // версиями и не аллоцирует.)
-        int hitCount = Physics.RaycastNonAlloc(
-            from,
-            toTarget / sightDistance,
-            obstructionHits,
-            sightDistance,
-            Physics.DefaultRaycastLayers,
-            QueryTriggerInteraction.Ignore);
-
-        bool occluded = false;
-
-        for (int i = 0; i < hitCount; i++)
-        {
-            Collider hit = obstructionHits[i].collider;
-
-            if (hit == null) continue;
-            if (hit.transform.IsChildOf(counter.transform)) continue;   // сама станция
-            if (playerColliders.Contains(hit)) continue;                // тело игрока
-            if (kitchenObject != null &&
-                hit.transform.IsChildOf(kitchenObject.transform)) continue; // несомый предмет
-
-            if (debugSightLine)
-            {
-                Debug.Log($"[Player] Обзор закрыт: '{hit.name}' " +
-                          $"({hit.gameObject.layer}) между игроком и '{counter.name}'.");
-            }
-
-            occluded = true;
-            break;
-        }
-
-        if (debugSightLine)
-        {
-            Debug.DrawLine(from, target, occluded ? Color.red : Color.green);
-        }
-
-        return occluded;
     }
 
     /// <summary>
@@ -397,34 +398,7 @@ public class Player : MonoBehaviour, IKitchenObjectParent
 
         idealPosition.y = transform.position.y; // высоту не трогаем
 
-        // Страховка №2: даже если выбор каким-то образом просочился за препятствие,
-        // притяжение не имеет права продавливать геометрию. Тот же капсульный каст,
-        // что и в обычном движении: упёрлись — останавливаемся вплотную, сквозь
-        // стену игрока больше не тащит никогда.
-        Vector3 targetPosition = Vector3.MoveTowards(transform.position, idealPosition, snapMoveSpeed * Time.deltaTime);
-        Vector3 snapStep = targetPosition - transform.position;
-
-        if (snapStep.sqrMagnitude > 0.000001f)
-        {
-            Vector3 snapDir = snapStep.normalized;
-            float snapDistance = snapStep.magnitude;
-
-            if (Physics.CapsuleCast(
-                transform.position,
-                transform.position + Vector3.up * playerHeight,
-                playerRadius,
-                snapDir,
-                out RaycastHit snapHit,
-                snapDistance,
-                Physics.DefaultRaycastLayers,
-                QueryTriggerInteraction.Ignore))
-            {
-                float allowedDistance = Mathf.Max(0f, snapHit.distance - 0.02f);
-                targetPosition = transform.position + snapDir * allowedDistance;
-            }
-        }
-
-        transform.position = targetPosition;
+        transform.position = Vector3.MoveTowards(transform.position, idealPosition, snapMoveSpeed * Time.deltaTime);
 
         Vector3 lookDir = counterCenter - transform.position;
         lookDir.y = 0f;
@@ -479,6 +453,12 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         if (GameLoopManager.Instance != null && !GameLoopManager.Instance.IsGamePlaying() && !GameLoopManager.Instance.IsPreparationActive())
             return;
 
+        // Черновик карт: во время гримуара E занята подтверждением выбора карты —
+        // это нажатие забирает UpgradeManager (подписан на то же событие), а здесь
+        // взаимодействие со столами не срабатывает и в буфер не попадает.
+        if (UpgradeManager.Instance != null && UpgradeManager.Instance.IsDraftActive)
+            return;
+
         if (selectedCounter != null)
         {
             selectedCounter.Interact(this);
@@ -498,6 +478,10 @@ public class Player : MonoBehaviour, IKitchenObjectParent
     private void GameInput_OnInteractAlternateAction(object sender, EventArgs e)
     {
         if (GameLoopManager.Instance != null && !GameLoopManager.Instance.IsGamePlaying() && !GameLoopManager.Instance.IsPreparationActive())
+            return;
+
+        // Черновик карт: F не работает, пока открыт гримуар (см. комментарий выше).
+        if (UpgradeManager.Instance != null && UpgradeManager.Instance.IsDraftActive)
             return;
 
         if (selectedCounter != null)

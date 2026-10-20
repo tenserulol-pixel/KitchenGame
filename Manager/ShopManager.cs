@@ -48,8 +48,21 @@ using UnityEngine;
 ///   старое поведение — автоспавн на ближайшей свободной ячейке (v1.1/v1.2).
 ///
 /// Для категории Upgrade: prefab может быть null, вместо спавна вызывается
-/// ApplyUpgradeEffect() — но пока этот метод пустой (заглушка для будущих апгрейдов
-/// вроде "Усиленный диспенсер тарелок" или "Вечный огонь").
+/// ApplyUpgradeEffect().
+///
+/// ★ v1.4 (БАГФИКС «деньги за воздух» — реальные эффекты апгрейдов):
+/// - ApplyUpgradeEffect больше НЕ заглушка. Каждый эффект реально применяется:
+///     RunicMortar      → CuttingCounter.UpgradeToRunic()      (резка быстрее)
+///     EternalFire      → StoveCounter.UpgradeToEternalFire()  (готовка быстрее)
+///     PurifyingWater   → SinkCounter.UpgradeToPurifyingWater()(мойка быстрее)
+///     SelfRefilling    → PlatesCounter.UpgradeToSelfRefilling() (стопка больше)
+/// - Apprentice/BookshelfKnowledge — эффекты ещё не реализованы: покупка
+///   ОТКЛОНЯЕТСЯ БЕЗ списания золота (раньше деньги брались, а эффект не применялся).
+/// - Если целевая станция отсутствует в сцене — покупка тоже отклоняется без списания.
+/// - Восстановление сейва: RestorePurchaseCounts теперь принимает формат сохранения
+///   (List<PurchaseCountSaveData>) и ПОСЛЕ восстановления счётчиков ЗАНОВО применяет
+///   эффекты всех купленных апгрейдов — иначе после «Продолжить» счётчик покупок был,
+///   а эффект исчезал.
 ///
 /// UI: сам ShopManager НЕ рисует интерфейс. Он только хранит состояние и стреляет
 /// событиями OnShopOpened / OnShopClosed / OnItemPurchased. UI подписывается на них
@@ -685,10 +698,12 @@ public class ShopManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Применяет эффект апгрейда к существующей станции. Пока что — заглушка: метод
-    /// проверяет, что effectType != None, и логирует. Реальные эффекты (RunicMortar,
-    /// EternalFire и т.д.) будут добавлены, когда мы реализуем методы UpgradeToRunic()
-    /// на CuttingCounter, StoveCounter, SinkCounter, PlatesCounter.
+    /// Применяет эффект апгрейда к существующей станции.
+    /// ★ v1.4 — БАГФИКС «деньги за воздух»: раньше метод был заглушкой (лог + return true),
+    /// и игрок платил золото за товар, который ничего не делал. Теперь каждый эффект
+    /// реально применяется к целевой станции; если применить НЕВОЗМОЖНО (эффект не
+    /// реализован, станции нет в сцене) — возвращается false, и TryBuyItem отклоняет
+    /// покупку ДО списания золота.
     /// </summary>
     private bool ApplyUpgradeEffect(ShopItemSO item)
     {
@@ -698,38 +713,153 @@ public class ShopManager : MonoBehaviour
             return false;
         }
 
-        // TODO: реализовать вызовы методов на соответствующих Counter'ах.
-        // Сейчас просто логируем — игра не падает, но эффект не применяется.
-        Debug.Log($"[ShopManager] Применён апгрейд '{item.displayName}' (эффект: {item.upgradeEffect}). " +
-                  $"Реализация эффекта будет добавлена в будущих шагах.");
+        switch (item.upgradeEffect)
+        {
+            case UpgradeEffect.RunicMortar:
+            {
+                CuttingCounter target = FindLiveCounter<CuttingCounter>();
+                if (target == null)
+                {
+                    Debug.LogError($"[ShopManager] '{item.displayName}': в сцене нет CuttingCounter — покупка отклонена (золото не списано).");
+                    return false;
+                }
+                target.UpgradeToRunic();
+                return true;
+            }
 
-        return true;
+            case UpgradeEffect.EternalFire:
+            {
+                StoveCounter target = FindLiveCounter<StoveCounter>();
+                if (target == null)
+                {
+                    Debug.LogError($"[ShopManager] '{item.displayName}': в сцене нет StoveCounter — покупка отклонена (золото не списано).");
+                    return false;
+                }
+                target.UpgradeToEternalFire();
+                return true;
+            }
+
+            case UpgradeEffect.PurifyingWater:
+            {
+                SinkCounter target = FindLiveCounter<SinkCounter>();
+                if (target == null)
+                {
+                    Debug.LogError($"[ShopManager] '{item.displayName}': в сцене нет SinkCounter — покупка отклонена (золото не списано).");
+                    return false;
+                }
+                target.UpgradeToPurifyingWater();
+                return true;
+            }
+
+            case UpgradeEffect.SelfRefilling:
+            {
+                PlatesCounter target = FindLiveCounter<PlatesCounter>();
+                if (target == null)
+                {
+                    Debug.LogError($"[ShopManager] '{item.displayName}': в сцене нет PlatesCounter — покупка отклонена (золото не списано).");
+                    return false;
+                }
+                target.UpgradeToSelfRefilling();
+                return true;
+            }
+
+            case UpgradeEffect.Apprentice:
+            case UpgradeEffect.BookshelfKnowledge:
+                // Эффекты пока не реализованы. ЧЕСТНОЕ поведение — не продавать:
+                // return false не даст FinalizePurchase списать золото за «воздух».
+                Debug.LogWarning($"[ShopManager] '{item.displayName}': эффект {item.upgradeEffect} ещё не реализован — товар временно не продаётся (золото не списано).");
+                return false;
+
+            default:
+                Debug.LogWarning($"[ShopManager] '{item.displayName}': неизвестный эффект {item.upgradeEffect} — покупка отклонена (золото не списано).");
+                return false;
+        }
     }
 
     /// <summary>
-    /// Возвращает снимок счётчика покупок для сохранения. SaveManager вызовет это
-    /// при сериализации GameSaveData.
+    /// ★ v1.4: поиск живой (не уничтоженной) станции нужного типа в сцене.
+    /// Обёртка с условной компиляцией по версии Unity — по тому же паттерну,
+    /// что в Editor/GridSnapEditor.cs.
     /// </summary>
-    public Dictionary<string, int> GetPurchaseCountsSnapshot()
+    private static T FindLiveCounter<T>() where T : BaseCounter
     {
-        return new Dictionary<string, int>(purchaseCounts);
+#if UNITY_2023_1_OR_NEWER
+          return UnityEngine.Object.FindFirstObjectByType<T>();
+#else
+        T[] found = FindObjectsOfType<T>();
+        return found != null && found.Length > 0 ? found[0] : null;
+#endif
     }
 
     /// <summary>
-    /// Восстанавливает счётчик покупок из сохранения. Вызывается GameLoopManager
-    /// при загрузке сохранения.
+    /// ★ v1.4: возвращает счётчик покупок в сериализуемом формате сохранения.
+    /// (JsonUtility не умеет Dictionary — поэтому List<PurchaseCountSaveData>.)
     /// </summary>
-    public void RestorePurchaseCounts(Dictionary<string, int> saved)
+    public List<PurchaseCountSaveData> GetPurchaseCountsForSave()
+    {
+        List<PurchaseCountSaveData> list = new List<PurchaseCountSaveData>();
+
+        foreach (KeyValuePair<string, int> kvp in purchaseCounts)
+        {
+            list.Add(new PurchaseCountSaveData { itemId = kvp.Key, count = kvp.Value });
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    /// Восстанавливает счётчик покупок из сохранения (формат GameSaveData) и
+    /// ★ v1.4: ЗАНОВО применяет эффекты всех купленных апгрейдов. Без реапплая
+    /// после «Продолжить» игра помнила бы, ЧТО апгрейд куплен (счётчик), но
+    /// эффект терялся до перезапуска — тот же класс «неполного сейва».
+    /// Вызывается GameLoopManager при загрузке сохранения (Start сцены).
+    /// </summary>
+    public void RestorePurchaseCounts(List<PurchaseCountSaveData> saved)
     {
         purchaseCounts.Clear();
-        if (saved == null) return;
-
-        foreach (var kvp in saved)
+        if (saved == null)
         {
-            purchaseCounts[kvp.Key] = kvp.Value;
+            Debug.Log("[ShopManager] В сохранении нет счётчиков покупок — начинаем с нуля (старый сейв без этого поля).");
+            return;
+        }
+
+        foreach (PurchaseCountSaveData entry in saved)
+        {
+            if (entry == null || string.IsNullOrEmpty(entry.itemId)) continue;
+            purchaseCounts[entry.itemId] = entry.count;
         }
 
         Debug.Log($"[ShopManager] Восстановлено {purchaseCounts.Count} записей о покупках.");
+
+        // Восстанавливаем ЭФФЕКТЫ купленных апгрейдов (идемпотентные методы
+        // на счётчиках делают повторный вызов безопасным).
+        ReapplyPurchasedUpgrades();
+    }
+
+    /// <summary>
+    /// ★ v1.4: повторное применение эффектов всех купленных апгрейдов из каталога.
+    /// </summary>
+    private void ReapplyPurchasedUpgrades()
+    {
+        if (catalog == null || catalog.items == null) return;
+
+        foreach (ShopItemSO item in catalog.items)
+        {
+            if (item == null) continue;
+
+            int count = GetPurchaseCount(item);
+            if (count <= 0) continue;
+
+            bool isUpgrade = item.category == ShopItemCategory.Upgrade || item.upgradeEffect != UpgradeEffect.None;
+            if (!isUpgrade) continue;
+
+            // Эффекты идемпотентны, поэтому просто вызываем ApplyUpgradeEffect;
+            // она сама залогирует фактическое применение (или «уже установлено»).
+            if (!ApplyUpgradeEffect(item))
+            {
+                Debug.LogWarning($"[ShopManager] Не удалось восстановить эффект купленного апгрейда '{item.displayName}'.");
+            }
+        }
     }
 
     // ★ v1.1: переиспользуемый буфер проверки стен — без аллокаций на покупку.

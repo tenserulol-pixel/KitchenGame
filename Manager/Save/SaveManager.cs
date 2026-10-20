@@ -153,10 +153,22 @@ public class GameSaveData
     /// а имя достаточно уникально для нашего каталога карт.</summary>
     public List<string> ownedUpgradeCardNames = new List<string>();
 
+    // === Магазин: счётчики покупок ===
+    /// <summary>★ v1.1 (багфикс): сколько раз куплен каждый товар магазина (по itemId).
+    /// Без этого поля после «Продолжить» счётчики сбрасывались — лимитированные товары
+    /// (maxPurchaseCount) можно было покупать заново. Заполняется ShopManager через
+    /// GameLoopManager.SaveCurrentProgress, восстанавливается ShopManager.RestorePurchaseCounts
+    /// (он же повторно применяет эффекты купленных апгрейдов).
+    /// Старые сейвы без этого поля совместимы: JsonUtility оставит список пустым.</summary>
+    public List<PurchaseCountSaveData> purchaseCounts = new List<PurchaseCountSaveData>();
+
     // === Расстановка столов и мебели ===
     /// <summary>Список всех купленных/перемещённых объектов мебели. При загрузке сцены
     /// GameScene должна пройти по этому списку и либо заспавнить новый объект (если его
-    /// не было на старте), либо переместить существующий на сохранённую позицию.</summary>
+    /// не было на старте), либо переместить существующий на сохранённую позицию.
+    /// ★ Заполняется FurnitureSaveUtility.CollectPlacedObjects() (через
+    /// GameLoopManager.SaveCurrentProgress), применяется при загрузке сцены
+    /// FurnitureSaveUtility.ApplySavedLayout().</summary>
     public List<PlacedObjectSaveData> placedObjects = new List<PlacedObjectSaveData>();
 
     // === Настройки (опционально — можно вынести в отдельный SettingsSaveData) ===
@@ -172,12 +184,31 @@ public class GameSaveData
 /// напрямую в читаемый JSON — он делает {"x":1,"y":2,"z":3}, что норм, но явные float
 /// поля дают контроль над форматом. Здесь используем Vector3 — JsonUtility с ним
 /// справляется корректно.
+///
+/// ★ objectName (v1.1): имя объекта без суффикса «(Clone)». По нему FurnitureSaveUtility
+/// при загрузке сопоставляет запись сохранения с объектом СЦЕНЫ (авторская мебель —
+/// у неё itemId пустой, спавнить её нечем). Для купленных предметов itemId заполнен,
+/// и если объект сцены с таким именем не нашёлся — предмет спавнится из каталога.
+/// Старые сохранения без objectName загрузятся: поле станет пустым, записи с пустым
+/// именем и пустым itemId будут пропущены с Warning'ом.
 /// </summary>
 [Serializable]
 public class PlacedObjectSaveData
 {
+    public string objectName;
     public string itemId;
     public Vector3 position;
     public Quaternion rotation;
 }
 
+/// <summary>
+/// ★ v1.1 (багфикс): одна запись «сколько раз куплен товар itemId».
+/// Dictionary<string,int> через JsonUtility не сериализуется — поэтому плоский список
+/// пар (тот же приём, что у placedObjects).
+/// </summary>
+[Serializable]
+public class PurchaseCountSaveData
+{
+    public string itemId;
+    public int count;
+}

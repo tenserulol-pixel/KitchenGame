@@ -1,14 +1,51 @@
 using UnityEngine;
-using System;
-using System.Collections;
-using System.Collections.Generic;
+
+/// <summary>
+/// ★ БАГФИКС (софтлок через мусорку) — v1.1
+///
+/// Раньше мусорка уничтожала ЛЮБОЙ предмет в руках игрока, включая тарелки. В этом
+/// проекте посуда КОНЕЧНА: PlatesCounter выдаёт фиксированный стек (4 шт. по умолчанию),
+/// пополняется он только возвратом чистой тарелки в стопку или мойкой грязной в раковине.
+/// Уничтоженная в мусорке тарелка исчезала НАВСЕГДА — выбросив все тарелки (или все грязные),
+/// игрок делал обслуживание гостей невозможным: заказы не собрать, не подать, день не
+/// завершить штатно. Классический путь к софтлоку.
+///
+/// Теперь мусорка принимает только ингредиенты и мусор. Тарелки (и чистые собранные,
+/// и грязные) она отказывается уничтожать с понятным сообщением в Console.
+/// </summary>
 public class TrashCounter : BaseCounter
 {
-public override void Interact(Player player)
+    public override void Interact(Player player)
     {
-        if (player.HasKitchenObject())
+        if (!player.HasKitchenObject())
         {
-            player.GetKitchenObject().DestroySelf();
+            return;
         }
+
+        KitchenObject objectToTrash = player.GetKitchenObject();
+
+        // 1) Чистая или собранная тарелка (в том числе с ингредиентами) — это
+        //    PlateKitchenObject. Пустую игрок обязан вернуть в стопку PlatesCounter
+        //    (E на стопке), собранную — разобрать нельзя, поэтому и её не принимаем.
+        if (objectToTrash is PlateKitchenObject)
+        {
+            Debug.Log("[TrashCounter] Тарелку выбросить нельзя — посуда в таверне конечна. " +
+                      "Пустую тарелку верни в стопку (PlatesCounter).");
+            return;
+        }
+
+        // 2) Грязная тарелка — обычный KitchenObject с KitchenObjectSO грязной посуды.
+        //    Типом её не отличить (это не PlateKitchenObject), поэтому проверяем по
+        //    реестру SO, который ведёт SinkCounter (у каждой раковины настроен свой
+        //    dirtyPlateKitchenObjectSO — они все попадают в один статический набор).
+        if (SinkCounter.IsDirtyPlateSO(objectToTrash.GetKitchenObjectSo()))
+        {
+            Debug.Log("[TrashCounter] Грязную тарелку выбросить нельзя — отнеси её в раковину " +
+                      "и помой, зажав F. Иначе посуда потеряется навсегда.");
+            return;
+        }
+
+        // Обычный ингредиент/мусор — уничтожаем, как раньше.
+        objectToTrash.DestroySelf();
     }
 }

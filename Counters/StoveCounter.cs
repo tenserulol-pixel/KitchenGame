@@ -59,6 +59,14 @@ public class StoveCounter : BaseCounter, IHasProgress
 
     private bool isPlayerStirring = false;
 
+    [Header("Магазинный апгрейд «Вечный огонь» (EternalFire)")]
+    [Tooltip("Во сколько раз быстрее перемешивание и варка после покупки апгрейда в лавке")]
+    [SerializeField] private float eternalFireSpeedMultiplier = 2f;
+
+    // ★ Магазинный апгрейд: флаг (а не умножение поля) — метод UpgradeToEternalFire()
+    // идемпотентен, поэтому безопасно вызывать его повторно при восстановлении сохранения.
+    private bool isEternalFireUpgraded = false;
+
     // Нестабильный котёл: сколько доп. перемешиваний осталось до варки (берётся
     // из UpgradeManager при подборе рецепта в котёл).
     private int pendingExtraStirs = 0;
@@ -527,9 +535,29 @@ public class StoveCounter : BaseCounter, IHasProgress
 
     public State GetState() => state;
 
-    // Быстрый огонь: множитель скорости перемешивания/варки (1.0 = база)
-    private float GetCookSpeed() =>
-        UpgradeManager.Instance != null ? UpgradeManager.Instance.GetCookSpeedMultiplier() : 1f;
+    /// <summary>
+    /// ★ Магазинный апгрейд «Вечный огонь» (ShopManager → UpgradeEffect.EternalFire).
+    /// Идемпотентен: повторный вызов (восстановление сохранения) ничего не ломает.
+    /// </summary>
+    public void UpgradeToEternalFire()
+    {
+        if (isEternalFireUpgraded)
+        {
+            Debug.Log($"[StoveCounter] '{name}': «Вечный огонь» уже разожжён.");
+            return;
+        }
+
+        isEternalFireUpgraded = true;
+        Debug.Log($"[StoveCounter] '{name}': куплен «Вечный огонь» — готовка быстрее в {eternalFireSpeedMultiplier}x.");
+    }
+
+    // Быстрый огонь: множитель скорости перемешивания/варки (1.0 = база),
+    // ★ умноженный на магазинный апгрейд «Вечный огонь», если он куплен.
+    private float GetCookSpeed()
+    {
+        float cardMultiplier = UpgradeManager.Instance != null ? UpgradeManager.Instance.GetCookSpeedMultiplier() : 1f;
+        return cardMultiplier * (isEternalFireUpgraded ? eternalFireSpeedMultiplier : 1f);
+    }
 
     // Быстрый огонь: множитель скорости сгорания (1.0 = база)
     private float GetBurnRate() =>

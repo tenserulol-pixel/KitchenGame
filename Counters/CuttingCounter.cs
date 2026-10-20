@@ -6,16 +6,24 @@ using System.Collections.Generic;
 public class CuttingCounter : BaseCounter, IHasProgress
 {
     public event EventHandler<IHasProgress.OnProgressChangedEventArgs> OnProgressChanged;
-    public event EventHandler OnCut; 
+    public event EventHandler OnCut;
 
-    [SerializeField] private CuttingRecipeSO[] cuttingRecipeSOarray; 
+    [SerializeField] private CuttingRecipeSO[] cuttingRecipeSOarray;
 
     [Header("Нестабильная магия (лужа на полу)")]
     [Tooltip("Префаб лужи — спавнится в свободной соседней ячейке при провале резки")]
     [SerializeField] private GameObject puddlePrefab;
 
+    [Header("Магазинный апгрейд «Руническая ступка» (RunicMortar)")]
+    [Tooltip("Во сколько раз быстрее резка после покупки апгрейда в лавке")]
+    [SerializeField] private float runicSpeedMultiplier = 2f;
+
     private float cuttingProgress; // Используем float для плавного удержания
     private bool isPlayerCutting = false;
+
+    // ★ Магазинный апгрейд: флаг (а не умножение поля) — метод UpgradeToRunic()
+    // идемпотентен, поэтому безопасно вызывать его повторно при восстановлении сохранения.
+    private bool isRunicUpgraded = false;
 
     private void Update()
     {
@@ -26,17 +34,18 @@ public class CuttingCounter : BaseCounter, IHasProgress
             if (HasRecipeWithInput(GetKitchenObject().GetKitchenObjectSo()))
             {
                 CuttingRecipeSO cuttingRecipeSO = GetCuttingRecipeSOWithInput(GetKitchenObject().GetKitchenObjectSo());
-                
-                // Плавно увеличиваем прогресс — множитель от карт вроде "Нестабильная магия",
-                // по умолчанию 1 (без Player или без карт — обычная скорость, ничего не меняется)
+
+                // Плавно увеличиваем прогресс:
+                // - множитель от карт вроде "Нестабильная магия" (по умолчанию 1);
+                // - ★ множитель магазинного апгрейда «Руническая ступка» (1 или runicSpeedMultiplier).
                 float speedMultiplier = Player.Instance != null ? Player.Instance.GetCuttingSpeedMultiplier() : 1f;
-                cuttingProgress += Time.deltaTime * speedMultiplier;
+                cuttingProgress += Time.deltaTime * speedMultiplier * GetShopSpeedMultiplier();
 
                 // Отправляем текущий прогресс в полоску UI
                 OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs
                 {
                     progressNormalized = cuttingProgress / cuttingRecipeSO.cuttingProgressMax
-                });  
+                });
 
                 // Если время удержания закончилось — объект нарезался!
                 if (cuttingProgress >= cuttingRecipeSO.cuttingProgressMax)
@@ -96,12 +105,12 @@ public class CuttingCounter : BaseCounter, IHasProgress
                 {
                     player.GetKitchenObject().SetKitchenObjectParent(this);
                     cuttingProgress = 0f; // Сброс прогресса под новый предмет
-                    
+
                     CuttingRecipeSO cuttingRecipeSO = GetCuttingRecipeSOWithInput(GetKitchenObject().GetKitchenObjectSo());
                     OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs
                     {
                         progressNormalized = cuttingProgress / cuttingRecipeSO.cuttingProgressMax
-                    });   
+                    });
                 }
             }
         }
@@ -114,8 +123,8 @@ public class CuttingCounter : BaseCounter, IHasProgress
                 {
                     if (plateKitchenObject.AddIngredient(GetKitchenObject().GetKitchenObjectSo()))
                     {
-                        GetKitchenObject().DestroySelf(); 
-                        
+                        GetKitchenObject().DestroySelf();
+
                         // Забрали ингредиент на тарелку — прячем UI
                         isPlayerCutting = false;
                         cuttingProgress = 0f;
@@ -127,7 +136,7 @@ public class CuttingCounter : BaseCounter, IHasProgress
             {
                 // Если у игрока пустые руки — он забирает предмет со стола
                 GetKitchenObject().SetKitchenObjectParent(player);
-                
+
                 // Предмет забрали — полностью сбрасываем и прячем полоску
                 isPlayerCutting = false;
                 cuttingProgress = 0f;
@@ -165,7 +174,9 @@ public class CuttingCounter : BaseCounter, IHasProgress
         Debug.Log($"[CuttingCounter] '{name}': не нашлось свободной соседней ячейки для лужи.");
     }
 
-    // Вызывается из Player.cs каждый кадр
+    // Вызывается из Player.cs каждый кадр.
+    // ★ Player.cs (багфикс): при уходе игрока от стола SetCuttingState(false) теперь
+    // гарантированно приходит — стол больше не режет «сам по себе» после отхода игрока.
     public void SetCuttingState(bool isCutting)
     {
         // Начинаем резать только если зажата кнопка И на столе лежит то, что можно нарезать
@@ -182,7 +193,7 @@ public class CuttingCounter : BaseCounter, IHasProgress
             // Если кнопку отпустили (или условия не подходят), плавно гасим процесс
             isPlayerCutting = false;
 
-            // Если игрок просто отошел или отпустил кнопку на полпути, 
+            // Если игрок просто отошел или отпустил кнопку на полпути,
             // мы НЕ сбрасываем cuttingProgress в 0, чтобы сохранить прогресс нарезки,
             // но если нарезка завершена, UI должен скрыться.
             if (!HasKitchenObject() || !HasRecipeWithInput(GetKitchenObject().GetKitchenObjectSo()))
@@ -192,6 +203,24 @@ public class CuttingCounter : BaseCounter, IHasProgress
             }
         }
     }
+
+    /// <summary>
+    /// ★ Магазинный апгрейд «Руническая ступка» (ShopManager → UpgradeEffect.RunicMortar).
+    /// Идемпотентен: повторный вызов (восстановление сохранения) ничего не ломает.
+    /// </summary>
+    public void UpgradeToRunic()
+    {
+        if (isRunicUpgraded)
+        {
+            Debug.Log($"[CuttingCounter] '{name}': «Руническая ступка» уже установлена.");
+            return;
+        }
+
+        isRunicUpgraded = true;
+        Debug.Log($"[CuttingCounter] '{name}': куплена «Руническая ступка» — резка быстрее в {runicSpeedMultiplier}x.");
+    }
+
+    private float GetShopSpeedMultiplier() => isRunicUpgraded ? runicSpeedMultiplier : 1f;
 
     private bool HasRecipeWithInput(KitchenObjectSO inputkitchenObjectSO)
     {
@@ -214,6 +243,6 @@ public class CuttingCounter : BaseCounter, IHasProgress
                 return cuttingRecipeSO;
             }
         }
-        return null; 
+        return null;
     }
 }
