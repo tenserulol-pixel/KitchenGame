@@ -153,6 +153,16 @@ public class GameSaveData
     /// а имя достаточно уникально для нашего каталога карт.</summary>
     public List<string> ownedUpgradeCardNames = new List<string>();
 
+    // === Черновик карт (гримуар) ===
+    /// <summary>★ v1.2 (фикс выхода в момент завершения дня): последний день, для
+    /// которого черновик карт уже РЕШЁН — карта взята или черновик пропущен.
+    /// 0 = черновик ещё не решался ни для одного дня.
+    /// Без этого поля черновик текущего дня после каждого перезапуска предлагался
+    /// бы заново: игрок мог бы выходить-заходить и собирать по одной карте за каждый
+    /// перезапуск (бесплатный фарма карт). Старые сейвы без поля читаются как 0 —
+    /// после обновления черновик один раз перепредложится, это приемлемо.</summary>
+    public int lastDraftDay = 0;
+
     // === Магазин: счётчики покупок ===
     /// <summary>★ v1.1 (багфикс): сколько раз куплен каждый товар магазина (по itemId).
     /// Без этого поля после «Продолжить» счётчики сбрасывались — лимитированные товары
@@ -170,6 +180,17 @@ public class GameSaveData
     /// GameLoopManager.SaveCurrentProgress), применяется при загрузке сцены
     /// FurnitureSaveUtility.ApplySavedLayout().</summary>
     public List<PlacedObjectSaveData> placedObjects = new List<PlacedObjectSaveData>();
+
+    // === Полы по зонам ===
+    /// <summary>★ v1.3 (фича «Полы по зонам»): какой скин пола назначен каждой зоне
+    /// (кухня / обеденный зал / вход). zoneId — идентификатор зоны из FloorManager,
+    /// skinItemId — skinId FloorSkinSO (он же itemId продавца-товара в лавке).
+    /// Зоны «По умолчанию» в списке отсутствуют — их отсутствие и означает дефолт.
+    /// Заполняется FloorManager.GetFloorSaveData() через GameLoopManager.SaveCurrentProgress,
+    /// восстанавливается FloorManager.RestoreFromSave при старте сцены.
+    /// Старые сейвы без этого поля совместимы: JsonUtility оставит список пустым —
+    /// все зоны останутся с исходными материалами.</summary>
+    public List<FloorZoneSkinSaveData> floorZones = new List<FloorZoneSkinSaveData>();
 
     // === Настройки (опционально — можно вынести в отдельный SettingsSaveData) ===
     public float masterVolume = 1f;
@@ -211,4 +232,17 @@ public class PurchaseCountSaveData
 {
     public string itemId;
     public int count;
+}
+
+/// <summary>
+/// ★ v1.3 (фича «Полы по зонам»): одна запись «какой скин назначен зоне пола».
+/// zoneId — id зоны из FloorManager (например «kitchen»), skinItemId — строковый
+/// идентификатор скина (FloorSkinSO.skinId == itemId продавца-товара).
+/// Тот же приём плоских пар, что и у PurchaseCountSaveData.
+/// </summary>
+[Serializable]
+public class FloorZoneSkinSaveData
+{
+    public string zoneId;
+    public string skinItemId;
 }

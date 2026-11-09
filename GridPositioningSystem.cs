@@ -7,6 +7,14 @@ using UnityEngine.SceneManagement;
 // прямо из редактора (например, для снапа стола к сетке при перетаскивании мышью).
 // Словарь occupiedCells в редакторе НЕ заполняется — это нужно только для play mode,
 // чтобы не было ложных конфликтов между объектами в редакторе и при запуске игры.
+//
+// ★ v1.6 (фича «Стены по рёбрам сетки»): предметы с маркером WallPiece живут
+// НЕ в ячейках, а на РЁБРАХ — границах МЕЖДУ клетками (WallEdgeKey = линия сетки
+// + номер сегмента на ней). Регистрация (BaseCounter.Awake → RegisterCounterAtCurrentPosition),
+// постановка (TryPlaceCounter), удаление (RemoveCounter) и AUTO-сетка маршрутизируют
+// стены в отдельный реестр occupiedWallEdges автоматически. Прилипание «к друг другу»:
+// точная геометрия рёбер (торцы соседних сегментов совпадают, перпендикулярные
+// встречаются в узле) + магнит к коллинеарным соседям в TrySnapWorldToWallEdge.
 [ExecuteAlways]
 public class GridPositioningSystem : MonoBehaviour
 {
@@ -45,6 +53,65 @@ public class GridPositioningSystem : MonoBehaviour
     // В редакторе пуст — Editor-скрипт снапа не проверяет занятость, чтобы не блокировать
     // расстановку объектов дизайнером (например, временное перекрытие при перемещении).
     private Dictionary<Vector2Int, BaseCounter> occupiedCells = new Dictionary<Vector2Int, BaseCounter>();
+
+    // ★ v1.6: реестр занятых РЁБЕР стенами. Ключ — ребро (линия + сегмент),
+    // значение — стена (BaseCounter с WallPiece). Стены не занимают ячейки:
+    // мебель свободно ставится в клетки по обе стороны от стены.
+    private Dictionary<WallEdgeKey, BaseCounter> occupiedWallEdges = new Dictionary<WallEdgeKey, BaseCounter>();
+
+    /// <summary>
+    /// ★ v1.6: ориентация ребра. AlongX — ребро вдоль мировой оси X (на линии z),
+    /// AlongZ — вдоль мировой оси Z (на линии x).
+    /// </summary>
+    public enum WallEdgeAxis
+    {
+        AlongX = 0,
+        AlongZ = 1
+    }
+
+    /// <summary>
+    /// ★ v1.6: ребро сетки — место, где стоит стена.
+    /// AlongX(x, z): сегмент по X на линии z — от worldX = origin + x*S до origin + (x+1)*S,
+    ///               сам лежит на worldZ = origin.z + z*S. Валидно: 0≤x&lt;bounds.x, 0≤z≤bounds.y.
+    /// AlongZ(x, z): сегмент по Z на линии x, лежит на worldX = origin.x + x*S.
+    ///               Валидно: 0≤x≤bounds.x, 0≤z&lt;bounds.y.
+    /// </summary>
+    public struct WallEdgeKey : System.IEquatable<WallEdgeKey>
+    {
+        public int x;
+        public int z;
+        public WallEdgeAxis axis;
+
+        public WallEdgeKey(int x, int z, WallEdgeAxis axis)
+        {
+            this.x = x;
+            this.z = z;
+            this.axis = axis;
+        }
+
+        public bool Equals(WallEdgeKey other)
+        {
+            return x == other.x && z == other.z && axis == other.axis;
+        }
+
+        public override bool Equals(object obj)
+        {
+            return obj is WallEdgeKey other && Equals(other);
+        }
+
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                return ((x * 397) ^ (z * 31)) ^ (int)axis;
+            }
+        }
+
+        public override string ToString()
+        {
+            return (axis == WallEdgeAxis.AlongX ? "H" : "V") + "(" + x + "," + z + ")";
+        }
+    }
 
     /// <summary>Размер ячейки сетки в метрах. Нужен Editor-скрипту для отрисовки превью.</summary>
     public float GetCellSize() => cellSize;
@@ -298,6 +365,20 @@ public class GridPositioningSystem : MonoBehaviour
         {
             if (counter == null) continue;
 
+            // ★ v1.6: стены бронируются на рёбрах — по геометрическому центру,
+            // без выравнивания (AUTO-сетка создаётся посреди игры).
+            if (counter.GetComponent<WallPiece>() != null)
+            {
+                WallEdgeKey wallEdge = DeriveWallEdgeFromCurrentPosition(counter);
+
+                if (IsEdgeInsideGrid(wallEdge) && !occupiedWallEdges.ContainsKey(wallEdge))
+                {
+                    occupiedWallEdges[wallEdge] = counter;
+                }
+
+                continue;
+            }
+
             Vector2Int cell = GetGridPosition(counter.transform.position);
 
             if (occupiedCells.ContainsKey(cell))
@@ -409,10 +490,44 @@ public class GridPositioningSystem : MonoBehaviour
     /// <summary>
     /// Регистрирует объект на его текущей позиции и выравнивает по сетке.
     /// Полезно для объектов, которые изначально расставлены на сцене в редакторе Unity.
+    ///
+    /// ★ v1.5: перед регистрацией СНИМАЕМ все прежние регистрации этого же счётчика.
+    /// Раньше метод проверял только занятость ЦЕЛЕВОЙ ячейки; если счётчик уже числился
+    /// в другой ячейке (двойной компонент BaseCounter на префабе, телепорт без снятия
+    /// регистрации и т.п.), старая запись оставалась навсегда — «фантомная» занятая
+    /// клетка, которую нельзя освободить никаким переносом. Теперь таких фантомов
+    /// не бывает: перерегистрация всегда атомарна (снял всё → зарегистрировал).
     /// </summary>
     public void RegisterCounterAtCurrentPosition(BaseCounter counter)
     {
         Vector2Int gridPos = GetGridPosition(counter.transform.position);
+
+        // ★ v1.5: защита от конфигурационной ошибки — несколько BaseCounter на одном
+        // GameObject. Каждый компонент регистрируется сам и создаёт вторую запись с
+        // потенциально другой ячейкой (дочерний Transform != корневого). Один объект =
+        // один компонент = одна ячейка.
+        BaseCounter[] siblings = counter.GetComponents<BaseCounter>();
+
+        if (siblings.Length > 1)
+        {
+            Debug.LogError($"[GridSystem] '{counter.gameObject.name}': найдено {siblings.Length} " +
+                           "компонентов BaseCounter на одном объекте — регистрация клеток дублируется. " +
+                           "Оставь ОДИН компонент (проверь и дочерние объекты префаба), иначе " +
+                           "часть ячеек останется фантомно занятой.");
+        }
+
+        // ★ v1.6: стены живут на РЁБРАХ, а не в ячейках — отдельный реестр,
+        // позиция — середина ребра, поворот — вдоль ребра.
+        if (WallPiece.IsWall(counter))
+        {
+            RegisterWallAtCurrentPosition(counter);
+            return;
+        }
+
+        // ★ v1.5: запоминаем прежнюю регистрацию (если была), но НЕ снимаем её до
+        // успешного прохождения конфликта — иначе при отказе счётчик остался бы
+        // вообще без ячейки.
+        bool hadRegistration = TryGetCellOf(counter, out Vector2Int previousCell);
 
         if (IsCellOccupied(gridPos))
         {
@@ -421,6 +536,19 @@ public class GridPositioningSystem : MonoBehaviour
 
             Debug.LogWarning($"[GridSystem] Конфликт! Ячейка {gridPos} уже занята объектом '{occupiedCells[gridPos].gameObject.name}'. Не удалось зарегистрировать '{counter.gameObject.name}'");
             return;
+        }
+
+        // ★ v1.5: конфликтов нет — снимаем ВСЕ прежние записи этого счётчика
+        // (где бы они ни были) и регистрируем заново. Перерегистрация атомарна.
+        if (hadRegistration)
+        {
+            RemoveAllRegistrations(counter);
+
+            if (previousCell != gridPos)
+            {
+                Debug.Log($"[GridSystem] '{counter.gameObject.name}' перерегистрирован: " +
+                          $"{previousCell} → {gridPos} (старая ячейка освобождена).");
+            }
         }
 
         // Выравниваем объект строго по центру ячейки
@@ -433,12 +561,386 @@ public class GridPositioningSystem : MonoBehaviour
         Debug.Log($"[GridSystem] '{counter.gameObject.name}' автоматически выровнен и зарегистрирован в ячейке {gridPos}");
     }
 
+    // ============================================================
+    //  ★ v1.6: СТЕНЫ ПО РЁБРАМ СЕТКИ
+    // ============================================================
+
+    /// <summary>Середина ребра (мировая точка на границе между клетками). Y = gridOrigin.y.</summary>
+    public Vector3 GetWallEdgeMidpoint(WallEdgeKey edge)
+    {
+        if (edge.axis == WallEdgeAxis.AlongX)
+        {
+            return new Vector3(
+                gridOrigin.x + (edge.x + 0.5f) * cellSize,
+                gridOrigin.y,
+                gridOrigin.z + edge.z * cellSize);
+        }
+
+        return new Vector3(
+            gridOrigin.x + edge.x * cellSize,
+            gridOrigin.y,
+            gridOrigin.z + (edge.z + 0.5f) * cellSize);
+    }
+
+    /// <summary>Лежит ли ребро в пределах сетки (учитывая допустимые диапазоны каждого типа).</summary>
+    public bool IsEdgeInsideGrid(WallEdgeKey edge)
+    {
+        if (edge.axis == WallEdgeAxis.AlongX)
+        {
+            return edge.x >= 0 && edge.x < gridBounds.x &&
+                   edge.z >= 0 && edge.z <= gridBounds.y;
+        }
+
+        return edge.x >= 0 && edge.x <= gridBounds.x &&
+               edge.z >= 0 && edge.z < gridBounds.y;
+    }
+
+    /// <summary>Занято ли ребро какой-либо стеной.</summary>
+    public bool IsEdgeOccupied(WallEdgeKey edge)
+    {
+        return occupiedWallEdges.ContainsKey(edge);
+    }
+
+    /// <summary>Кто занимает ребро (для диагностики). Если пусто — false.</summary>
+    public bool TryGetWallEdgeOwner(WallEdgeKey edge, out BaseCounter owner)
+    {
+        if (occupiedWallEdges.TryGetValue(edge, out BaseCounter found) && found != null)
+        {
+            owner = found;
+            return true;
+        }
+
+        owner = null;
+        return false;
+    }
+
+    /// <summary>
+    /// Свободно ли ребро для данной стены: пусто, либо занято ею же самой
+    /// (её собственное ребро при переносе не считается препятствием).
+    /// </summary>
+    public bool IsEdgeFreeFor(WallEdgeKey edge, BaseCounter wall)
+    {
+        return !occupiedWallEdges.TryGetValue(edge, out BaseCounter owner) || owner == wall;
+    }
+
+    /// <summary>Есть ли у ребра занятый СОСЕДЬ ПО ТОЙ ЖЕ ЛИНИИ — для магнита «продолжить стену».</summary>
+    private bool HasOccupiedCollinearNeighbor(WallEdgeKey edge)
+    {
+        if (edge.axis == WallEdgeAxis.AlongX)
+        {
+            return IsEdgeOccupied(new WallEdgeKey(edge.x - 1, edge.z, WallEdgeAxis.AlongX)) ||
+                   IsEdgeOccupied(new WallEdgeKey(edge.x + 1, edge.z, WallEdgeAxis.AlongX));
+        }
+
+        return IsEdgeOccupied(new WallEdgeKey(edge.x, edge.z - 1, WallEdgeAxis.AlongZ)) ||
+               IsEdgeOccupied(new WallEdgeKey(edge.x, edge.z + 1, WallEdgeAxis.AlongZ));
+    }
+
+    /// <summary>
+    /// Выводит ребро из текущего положения стены: берём геометрический центр
+    /// (падает на середину ребра при снапе) + ориентацию длинной оси по bounds.
+    /// Нужен регистрации на Awake-пути, сейву и диагностике.
+    /// </summary>
+    public WallEdgeKey DeriveWallEdgeFromCurrentPosition(BaseCounter wall)
+    {
+        Vector3 probe = wall.transform.position;
+
+        if (WallPiece.TryGetGeometryCenter(wall, out Vector3 center))
+        {
+            probe = center;
+        }
+
+        bool longAxisIsWorldX = true;
+
+        if (WallPiece.TryGetGeometryBounds(wall, out Bounds bounds))
+        {
+            float currentYaw = NormalizeAngleTo360(wall.transform.rotation.eulerAngles.y);
+            int quarter = Mathf.RoundToInt(currentYaw / 90f) % 2;
+            longAxisIsWorldX = (quarter == 0)
+                ? bounds.size.x >= bounds.size.z
+                : bounds.size.z >= bounds.size.x;
+        }
+
+        if (longAxisIsWorldX)
+        {
+            int lineZ = Mathf.Clamp(Mathf.RoundToInt((probe.z - gridOrigin.z) / cellSize), 0, gridBounds.y);
+            int cellX = Mathf.Clamp(Mathf.FloorToInt((probe.x - gridOrigin.x) / cellSize), 0, gridBounds.x - 1);
+            return new WallEdgeKey(cellX, lineZ, WallEdgeAxis.AlongX);
+        }
+
+        int lineX = Mathf.Clamp(Mathf.RoundToInt((probe.x - gridOrigin.x) / cellSize), 0, gridBounds.x);
+        int cellZ = Mathf.Clamp(Mathf.FloorToInt((probe.z - gridOrigin.z) / cellSize), 0, gridBounds.y - 1);
+        return new WallEdgeKey(lineX, cellZ, WallEdgeAxis.AlongZ);
+    }
+
+    /// <summary>
+    /// Ближайшее к точке world СВОБОДНОЕ ребро — ядро прилипания стен.
+    /// Берём ближайший узел сетки и четыре ребра вокруг него (два AlongX,
+    /// два AlongZ); расстояние считается ДО СЕГМЕНТА, а не до узла — иначе
+    /// стена «гуляла» бы по линии. orientationOverride: 0 — авто,
+    /// 1 — только AlongX, 2 — только AlongZ (переключается клавишей R).
+    /// Занятые чужими стенами рёбра не предлагаются; ребро с занятым
+    /// коллинеарным соседом получает магнит (дистанция ×0.5) — стены
+    /// естественно продолжают линию друг друга.
+    /// </summary>
+    public bool TrySnapWorldToWallEdge(Vector3 world, BaseCounter wall, int orientationOverride, out WallEdgeKey edge)
+    {
+        edge = default;
+
+        int nodeX = Mathf.Clamp(Mathf.RoundToInt((world.x - gridOrigin.x) / cellSize), 0, gridBounds.x);
+        int nodeZ = Mathf.Clamp(Mathf.RoundToInt((world.z - gridOrigin.z) / cellSize), 0, gridBounds.y);
+
+        WallEdgeKey? best = null;
+        float bestDist = float.MaxValue;
+
+        for (int pass = 0; pass < 2; pass++)
+        {
+            bool alongX = pass == 0;
+
+            if (orientationOverride == 1 && !alongX) continue;
+            if (orientationOverride == 2 && alongX) continue;
+
+            for (int side = -1; side <= 1; side += 2)
+            {
+                WallEdgeKey candidate = alongX
+                    ? new WallEdgeKey(nodeX + (side < 0 ? -1 : 0), nodeZ, WallEdgeAxis.AlongX)
+                    : new WallEdgeKey(nodeX, nodeZ + (side < 0 ? -1 : 0), WallEdgeAxis.AlongZ);
+
+                if (!IsEdgeInsideGrid(candidate)) continue;
+                if (!IsEdgeFreeFor(candidate, wall)) continue;
+
+                Vector3 start = GetWallEdgeMidpoint(candidate);
+                Vector3 end = start;
+
+                if (alongX)
+                {
+                    start.x -= cellSize * 0.5f;
+                    end.x += cellSize * 0.5f;
+                }
+                else
+                {
+                    start.z -= cellSize * 0.5f;
+                    end.z += cellSize * 0.5f;
+                }
+
+                float dist = SqrDistancePointToSegmentXZ(world, start, end);
+
+                // ★ МАГНИТ «к друг другу»: продолжение существующей линии стен.
+                if (HasOccupiedCollinearNeighbor(candidate))
+                {
+                    dist *= 0.5f;
+                }
+
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    best = candidate;
+                }
+            }
+        }
+
+        if (best == null)
+        {
+            return false;
+        }
+
+        edge = best.Value;
+        return true;
+    }
+
+    private static float SqrDistancePointToSegmentXZ(Vector3 p, Vector3 a, Vector3 b)
+    {
+        float abx = b.x - a.x;
+        float abz = b.z - a.z;
+        float apx = p.x - a.x;
+        float apz = p.z - a.z;
+
+        float abLenSqr = abx * abx + abz * abz;
+
+        float t = abLenSqr > 0.0001f
+            ? Mathf.Clamp01((apx * abx + apz * abz) / abLenSqr)
+            : 0f;
+
+        float cx = a.x + abx * t - p.x;
+        float cz = a.z + abz * t - p.z;
+
+        return cx * cx + cz * cz;
+    }
+
+    /// <summary>
+    /// Ставит стену на ребро: проверяет границы/занятость, снимает прежние
+    /// регистрации (клетки и рёбра), ставит геометрический центр на середину
+    /// ребра и поворачивает вдоль него. Пивот может быть где угодно — центрируется
+    /// именно геометрия (WallPiece.TryGetGeometryCenter).
+    /// </summary>
+    public bool TryPlaceWall(BaseCounter wall, WallEdgeKey edge)
+    {
+        if (wall == null) return false;
+
+        if (!IsEdgeInsideGrid(edge))
+        {
+            Debug.LogWarning($"[GridSystem] Ребро {edge} вне сетки (bounds {gridBounds}) — стена не размещена.");
+            return false;
+        }
+
+        if (!IsEdgeFreeFor(edge, wall))
+        {
+            string ownerName = TryGetWallEdgeOwner(edge, out BaseCounter owner) && owner != null
+                ? owner.gameObject.name
+                : "?";
+
+            Debug.LogWarning($"[GridSystem] Ребро {edge} уже занято стеной '{ownerName}' — выбери другое место.");
+            return false;
+        }
+
+        SnapWallToEdgeInternal(wall, edge);
+        Debug.Log($"[GridSystem] Стена '{wall.gameObject.name}' размещена на ребре {edge}.");
+        return true;
+    }
+
+    /// <summary>
+    /// Ищет свободное ребро рядом с текущим положением стены (кольца радиусом 1..3,
+    /// только коллинеарные рёбра — ориентация стены сохраняется) и ставит на него.
+    /// Нужен восстановлению сейва, когда сохранённое ребро чем-то занято.
+    /// </summary>
+    public bool TryRelocateWallToNearestFreeEdge(BaseCounter wall)
+    {
+        if (wall == null) return false;
+
+        WallEdgeKey home = DeriveWallEdgeFromCurrentPosition(wall);
+
+        for (int radius = 1; radius <= 3; radius++)
+        {
+            for (int dx = -radius; dx <= radius; dx++)
+            {
+                for (int dz = -radius; dz <= radius; dz++)
+                {
+                    if (Mathf.Abs(dx) != radius && Mathf.Abs(dz) != radius) continue;
+
+                    WallEdgeKey candidate = new WallEdgeKey(home.x + dx, home.z + dz, home.axis);
+
+                    if (IsEdgeInsideGrid(candidate) && IsEdgeFreeFor(candidate, wall))
+                    {
+                        return TryPlaceWall(wall, candidate);
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>Регистрация стены на её текущем месте (путь BaseCounter.Awake и восстановления сейва).</summary>
+    private void RegisterWallAtCurrentPosition(BaseCounter wall)
+    {
+        if (!WallPiece.TryGetGeometryCenter(wall, out Vector3 center))
+        {
+            Debug.LogError($"[GridSystem] '{wall.gameObject.name}': у стены нет геометрии (BoxCollider/Renderer) — ребро не определить, регистрация пропущена.");
+            return;
+        }
+
+        WallEdgeKey edge = DeriveWallEdgeFromCurrentPosition(wall);
+
+        if (!IsEdgeInsideGrid(edge))
+        {
+            Debug.LogWarning($"[GridSystem] '{wall.gameObject.name}': ребро {edge} вне сетки (bounds {gridBounds}) — стена НЕ зарегистрирована. Сдвинь её внутрь зоны сетки.");
+            return;
+        }
+
+        if (IsEdgeOccupied(edge) && occupiedWallEdges[edge] != wall)
+        {
+            Debug.LogWarning($"[GridSystem] Конфликт! Ребро {edge} уже занято стеной '{occupiedWallEdges[edge].gameObject.name}'. '{wall.gameObject.name}' НЕ зарегистрирована — сдвинь одну из стен.");
+            return;
+        }
+
+        SnapWallToEdgeInternal(wall, edge);
+        Debug.Log($"[GridSystem] Стена '{wall.gameObject.name}' зарегистрирована на ребре {edge} (позиция {wall.transform.position}).");
+    }
+
+    /// <summary>
+    /// Атомарная постановка стены на ребро: снять все старые регистрации →
+    /// выровнять поворот вдоль ребра → посадить геометрический центр на середину →
+    /// забронировать ребро.
+    /// </summary>
+    private void SnapWallToEdgeInternal(BaseCounter wall, WallEdgeKey edge)
+    {
+        RemoveAllRegistrations(wall);
+
+        bool edgeAlongX = edge.axis == WallEdgeAxis.AlongX;
+        Vector3 midpoint = GetWallEdgeMidpoint(edge);
+        Quaternion alignedRotation = Quaternion.Euler(0f, GetEdgeAlignedYaw(wall, edgeAlongX), 0f);
+
+        if (WallPiece.TryGetGeometryCenter(wall, out Vector3 center))
+        {
+            // Локальный оффсет «пивот → центр геометрии» в ТЕКУЩЕЙ ориентации,
+            // затем переносим его в новую (выровненную). На ребро садится именно
+            // геометрический центр стены — пивот префаба может быть где угодно.
+            Vector3 localOffset = Quaternion.Inverse(wall.transform.rotation) * (center - wall.transform.position);
+            Vector3 worldOffset = alignedRotation * localOffset;
+
+            Vector3 pos = new Vector3(
+                midpoint.x - worldOffset.x,
+                wall.transform.position.y,
+                midpoint.z - worldOffset.z);
+
+            wall.transform.rotation = alignedRotation;
+            wall.transform.position = pos;
+        }
+        else
+        {
+            wall.transform.rotation = alignedRotation;
+            wall.transform.position = new Vector3(midpoint.x, wall.transform.position.y, midpoint.z);
+        }
+
+        occupiedWallEdges[edge] = wall;
+    }
+
+    /// <summary>
+    /// Поворот стены (yaw), при котором её длинная ось ложится вдоль ребра:
+    /// AlongX → 0/180, AlongZ → 90/270. Длинная ось определяется по bounds
+    /// геометрии с поправкой на текущую четверть поворота.
+    /// </summary>
+    private float GetEdgeAlignedYaw(BaseCounter wall, bool edgeAlongX)
+    {
+        if (!WallPiece.TryGetGeometryBounds(wall, out Bounds bounds))
+        {
+            return 0f;
+        }
+
+        float currentYaw = NormalizeAngleTo360(wall.transform.rotation.eulerAngles.y);
+        int quarter = Mathf.RoundToInt(currentYaw / 90f) % 2;
+        bool longAxisIsWorldX = (quarter == 0)
+            ? bounds.size.x >= bounds.size.z
+            : bounds.size.z >= bounds.size.x;
+
+        return (longAxisIsWorldX == edgeAlongX) ? 0f : 90f;
+    }
+
+    private static float NormalizeAngleTo360(float yaw)
+    {
+        yaw %= 360f;
+        if (yaw < 0f) yaw += 360f;
+        return yaw;
+    }
+
     /// <summary>
     /// Пытается разместить счетчик/стол на сетке (например, при покупке стола).
     /// </summary>
     /// <returns>True, если размещение успешно. False, если ячейка занята.</returns>
     public bool TryPlaceCounter(BaseCounter counter, Vector3 targetWorldPosition)
     {
+        // ★ v1.6: стены не живут в ячейках — ближайшее ребро + прилипание.
+        if (counter != null && counter.GetComponent<WallPiece>() != null)
+        {
+            if (TrySnapWorldToWallEdge(targetWorldPosition, counter, 0, out WallEdgeKey wallEdge))
+            {
+                return TryPlaceWall(counter, wallEdge);
+            }
+
+            Debug.LogWarning($"[GridSystem] '{counter.gameObject.name}': рядом с {targetWorldPosition} нет свободного ребра — стена не размещена.");
+            return false;
+        }
+
         Vector2Int gridPos = GetGridPosition(targetWorldPosition);
 
         if (IsCellOccupied(gridPos) && occupiedCells[gridPos] != counter)
@@ -473,6 +975,15 @@ public class GridPositioningSystem : MonoBehaviour
     public IReadOnlyDictionary<Vector2Int, BaseCounter> GetOccupiedCellsSnapshot()
     {
         return new Dictionary<Vector2Int, BaseCounter>(occupiedCells);
+    }
+
+    /// <summary>
+    /// ★ v1.6: снимок рёберного реестра стен — нужен FurnitureSaveUtility
+    /// при сохранении расстановки. Возвращается КОПИЯ словаря.
+    /// </summary>
+    public IReadOnlyDictionary<WallEdgeKey, BaseCounter> GetWallEdgesSnapshot()
+    {
+        return new Dictionary<WallEdgeKey, BaseCounter>(occupiedWallEdges);
     }
 
     /// <summary>
@@ -518,26 +1029,139 @@ public class GridPositioningSystem : MonoBehaviour
 
     /// <summary>
     /// Находит и удаляет переданный стол из реестра занятых ячеек сетки.
+    ///
+    /// ★ v1.5: удаляет ВСЕ записи счётчика, а не только первую. Если по какой-то
+    /// причине счётчик успел зарегистрироваться дважды (двойной компонент,
+    /// телепорт мимо API), старая версия оставляла фантомную ячейку навсегда —
+    /// типичный симптом: «перенёс CuttingCounter, а старая клетка всё равно занята».
+    /// Теперь лишние регистрации снимаются автоматически, с явным Warning в Console.
     /// </summary>
     public void RemoveCounter(BaseCounter counter)
     {
-        Vector2Int keyToRemove = Vector2Int.zero;
-        bool found = false;
+        int removed = RemoveAllRegistrations(counter);
 
-        foreach (var kvp in occupiedCells)
+        if (removed > 1)
+        {
+            Debug.LogWarning($"[GridSystem] '{counter.gameObject.name}': в реестре было {removed} " +
+                             "регистраций одновременно (фантомные ячейки) — все сняты. " +
+                             "Причина обычно в повторном вызове RegisterCounterAtCurrentPosition " +
+                             "или во втором компоненте BaseCounter на объекте.");
+        }
+    }
+
+    /// <summary>
+    /// ★ v1.5: снимает ВСЕ регистрации данного счётчика. Возвращает, сколько записей снято.
+    /// </summary>
+    public int RemoveAllRegistrations(BaseCounter counter)
+    {
+        int removed = 0;
+
+        // Словарь нельзя менять во время foreach — собираем ключи, потом удаляем.
+        List<Vector2Int> keysToRemove = new List<Vector2Int>();
+
+        foreach (KeyValuePair<Vector2Int, BaseCounter> kvp in occupiedCells)
         {
             if (kvp.Value == counter)
             {
-                keyToRemove = kvp.Key;
-                found = true;
-                break;
+                keysToRemove.Add(kvp.Key);
             }
         }
 
-        if (found)
+        foreach (Vector2Int key in keysToRemove)
         {
-            occupiedCells.Remove(keyToRemove);
-            Debug.Log($"[GridSystem] Объект {counter.gameObject.name} удален. Ячейка {keyToRemove} теперь свободна.");
+            occupiedCells.Remove(key);
+            removed++;
+            Debug.Log($"[GridSystem] Объект {counter.gameObject.name} удален. Ячейка {key} теперь свободна.");
+        }
+
+        // ★ v1.6: рёберный реестр стен чистим тем же заходом — иначе после
+        // удаления стены её ребро осталось бы занятым навсегда.
+        List<WallEdgeKey> edgeKeysToRemove = new List<WallEdgeKey>();
+
+        foreach (KeyValuePair<WallEdgeKey, BaseCounter> wallKvp in occupiedWallEdges)
+        {
+            if (wallKvp.Value == counter)
+            {
+                edgeKeysToRemove.Add(wallKvp.Key);
+            }
+        }
+
+        foreach (WallEdgeKey key in edgeKeysToRemove)
+        {
+            occupiedWallEdges.Remove(key);
+            removed++;
+            Debug.Log($"[GridSystem] Объект {counter.gameObject.name} удален. Ребро {key} теперь свободно.");
+        }
+
+        return removed;
+    }
+
+    /// <summary>
+    /// ★ v1.5: сколько ячеек реестра сейчас держит данный счётчик.
+    /// Норма — 0 (не зарегистрирован) или 1. Больше 1 = фантом (см. RemoveCounter).
+    /// </summary>
+    public int CountRegistrations(BaseCounter counter)
+    {
+        int count = 0;
+
+        foreach (KeyValuePair<Vector2Int, BaseCounter> kvp in occupiedCells)
+        {
+            if (kvp.Value == counter) count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// ★ v1.5: полный дамп реестра занятых ячеек в Console.
+    /// Вызывается через контекстное меню компонента (правый клик по заголовку
+    /// GridPositioningSystem в Inspector → «Dump Occupied Cells») при живой игре.
+    /// Мгновенно видно: какая ячейка кем занята, есть ли фантомные регистрации.
+    /// </summary>
+    [ContextMenu("Dump Occupied Cells")]
+    public void DebugDumpOccupiedCells()
+    {
+        Debug.Log($"[GridSystem] === ДАМП РЕЕСТРА: {occupiedCells.Count} занятых ячеек ===");
+
+        foreach (KeyValuePair<Vector2Int, BaseCounter> kvp in occupiedCells)
+        {
+            if (kvp.Value == null)
+            {
+                Debug.Log($"  {kvp.Key} → <null> (уничтоженный объект — регистрация протухла)");
+                continue;
+            }
+
+            int regs = CountRegistrations(kvp.Value);
+            string marker = regs > 1 ? "  ← ФАНТОМ: у объекта " + regs + " регистраций!" : "";
+
+            Debug.Log($"  {kvp.Key} → '{kvp.Value.gameObject.name}' (позиция {kvp.Value.transform.position}){marker}");
+        }
+    }
+
+    /// <summary>
+    /// ★ v1.5: чистка протухших записей — ячейки, ссылающиеся на уничтоженные объекты.
+    /// Unity делает «== null» для Destroy-нутых объектов, но ключ в словаре остаётся.
+    /// Вызывается через контекстное меню, на каждый кадр не вешаем.
+    /// </summary>
+    [ContextMenu("Purge Destroyed Entries")]
+    public void PurgeDestroyedEntries()
+    {
+        List<Vector2Int> deadKeys = new List<Vector2Int>();
+
+        foreach (KeyValuePair<Vector2Int, BaseCounter> kvp in occupiedCells)
+        {
+            if (kvp.Value == null) deadKeys.Add(kvp.Key);
+        }
+
+        foreach (Vector2Int key in deadKeys)
+        {
+            occupiedCells.Remove(key);
+            Debug.LogWarning($"[GridSystem] Протухшая запись удалена: ячейка {key} ссылалась на уничтоженный объект.");
+        }
+
+        if (deadKeys.Count == 0)
+        {
+            Debug.Log("[GridSystem] Протухших записей нет.");
         }
     }
 
@@ -558,6 +1182,19 @@ public class GridPositioningSystem : MonoBehaviour
                 // Рисуем границы ячейки плоским кубом на полу
                 Gizmos.DrawWireCube(cellCenter, new Vector3(cellSize, 0.05f, cellSize));
             }
+        }
+
+        // ★ v1.6: занятые рёбра стен — оранжевые планки по границам клеток.
+        Gizmos.color = new Color(1f, 0.6f, 0.1f, 0.9f);
+
+        foreach (KeyValuePair<WallEdgeKey, BaseCounter> wallKvp in occupiedWallEdges)
+        {
+            Vector3 edgeMid = GetWallEdgeMidpoint(wallKvp.Key);
+            Vector3 edgeSize = wallKvp.Key.axis == WallEdgeAxis.AlongX
+                ? new Vector3(cellSize, 0.06f, 0.12f)
+                : new Vector3(0.12f, 0.06f, cellSize);
+
+            Gizmos.DrawCube(edgeMid, edgeSize);
         }
     }
 }

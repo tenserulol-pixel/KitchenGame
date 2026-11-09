@@ -2,23 +2,28 @@ using UnityEngine;
 using System;
 
 /// <summary>
-/// ★ v2 (БАГФИКС-ПРОХОД) — СЛИЯНИЕ ДВУХ ВЕТОК ЭТОГО ФАЙЛА.
+/// ★ v3 (ФИКС ВЫХОДА В МОМЕНТ ЗАВЕРШЕНИЯ ДНЯ) — надстройка над v2 (слияние веток).
 ///
-/// Предыдущий деливерабл (download/grid/GameLoopManager.cs) был собран на старой базе
-/// и терял важные методы v7, из-за чего проект с ShopManager v1.3+/FurnitureMovingController
-/// v2.3/UpgradeManager (карты) НЕ КОМПИЛИРОВАЛСЯ. Эта версия содержит ВСЁ:
+/// ЧТО СЛОМАНО БЫЛО:
+/// 1. Счётчик дня. currentDay++ жил в StartNextDayPreparation (по нажатию Space/Enter
+///    на экране итогов) и НИКОГДА не сохранялся: FinishActiveDay сохранял СТАРЫЙ день.
+///    Любой выход «в момент завершения дня» (Alt+F4 на итогах, Escape в меню, выход
+///    из подготовки следующего дня без покупок) — и после «Продолжить» игрок
+///    возвращался на УЖЕ ПРОЙДЕННЫЙ день.
+///    Теперь семантика currentDay: «день, который предстоит играть». Инкремент
+///    переехал в FinishActiveDay (день завершён → следующий день уже актуален),
+///    и ЛЮБОЕ сохранение после завершения дня фиксирует уже новый день.
+/// 2. Карты улучшений. SaveCurrentProgress заполнял ownedUpgradeCardNames
+///    пустым списком (незакрытый «шаг 5»), а восстановления карт из сейва не было
+///    вовсе — карта жила только в памяти сцены и стиралась любым выходом.
+///    Теперь карты сохраняются по cardName, восстанавливаются в UpgradeManager
+///    (с повторным применением эффектов, кроме разового золота «Задатка»),
+///    а черновик дня защищён от перевыдачи перезапуском полем lastDraftDay.
 ///
-/// - База v7: PushUiInputLock/PopUiInputLock/IsUiInputLocked (модальные экраны),
-///   гейт Enter поверх модальных экранов, гейт черновика карт в StartCountdown,
-///   DecreaseAngryCustomerTolerance (Патч 2, карта «Тёмная сделка» — без него DarkDeal
-///   из card_ui/UpgradeManager.cs не компилируется и работает инвертированно).
-/// - Ветка сетки (grid-save): применение сохранённой расстановки мебели через кадр
-///   после старта сцены (FurnitureSaveUtility.ApplySavedLayout) и заполнение
-///   placedObjects при сохранении (FurnitureSaveUtility.CollectPlacedObjects).
-/// - НОВОЕ (багфикс): сохранение и восстановление счётчиков покупок магазина
-///   (purchaseCounts). Раньше они вообще не сохранялись — после «Продолжить» лимитные
-///   товары (maxPurchaseCount) можно было покупать заново, а RestorePurchaseCounts
-///   оставался мёртвым кодом.
+/// ВСЁ ИЗ v2 НА МЕСТЕ: PushUiInputLock/PopUiInputLock/IsUiInputLocked,
+/// DecreaseAngryCustomerTolerance (карта «Тёмная сделка»), применение сохранённой
+/// расстановки мебели (FurnitureSaveUtility.ApplySavedLayout), восстановление
+/// счётчиков покупок магазина (ShopManager.RestorePurchaseCounts).
 /// </summary>
 public class GameLoopManager : MonoBehaviour
 {
@@ -138,6 +143,11 @@ public class GameLoopManager : MonoBehaviour
         // Внутри RestorePurchaseCounts также повторно применяются эффекты всех
         // купленных апгрейдов («Очищенная вода», «Вечный огонь» и т.д.).
         RestoreShopStateFromSave();
+
+        // ★ v3.1: восстанавливаем скины, назначенные зонам пола. Внутри — подмена
+        // материалов рендереров по сохранённым zoneId → skinItemId. При отсутствии
+        // записей (старый сейв / фича не размечена) зоны остаются дефолтными.
+        RestoreFloorFromSave();
     }
 
     /// <summary>
@@ -167,6 +177,23 @@ public class GameLoopManager : MonoBehaviour
         {
             ShopManager.Instance.RestorePurchaseCounts(save.purchaseCounts);
         }
+    }
+
+    /// <summary>
+    /// ★ v3.1: восстанавливает скины, назначенные зонам пола, из сохранения.
+    /// FloorManager сам разбирает список (зоны без записи остаются дефолтными),
+    /// здесь только гейт «есть ли сейв вообще» и null-страховки.
+    /// </summary>
+    private void RestoreFloorFromSave()
+    {
+        if (FloorManager.Instance == null) return;
+
+        if (SaveManager.Instance == null || !SaveManager.Instance.HasSave()) return;
+
+        GameSaveData save = SaveManager.Instance.GetCurrentSave();
+        if (save == null) return;
+
+        FloorManager.Instance.RestoreFromSave(save.floorZones);
     }
 
     private void Update()
@@ -288,15 +315,23 @@ public class GameLoopManager : MonoBehaviour
         int netProfit = goldEarnedToday - goldLostToday;
         totalGold = Mathf.Max(0, totalGold + netProfit);
 
+        // ★ v3: день завершён → инкрементируем счётчик СРАЗУ ЗДЕСЬ, а не при нажатии
+        // Space/Enter на экране итогов (как было в StartNextDayPreparation).
+        // Раньше любое сохранение после завершения дня писало СТАРЫЙ день, и после
+        // «Продолжить» игрок начинал уже пройденный день заново. Теперь currentDay
+        // всегда означает «день, который предстоит играть», и любой выход из игры
+        // (итоги, подготовка следующего дня) сохраняет корректный день.
+        currentDay++;
+
         // Сохраняем прогресс в SaveManager — на случай, если игрок закроет игру
         // прямо здесь, на экране результатов, не переходя на следующий день.
-        // Без этого SaveManager.HasSave() возвращал бы true при следующем запуске,
-        // но текущий день был бы устаревшим (старое значение до завершения).
+        // ★ v3: сейв теперь содержит уже ИНКРЕМЕНТИРОВАННЫЙ день, плюс карты
+        // улучшений (ownedUpgradeCardNames) и статус черновика (lastDraftDay).
         SaveCurrentProgress();
 
         OnStateChanged?.Invoke(this, EventArgs.Empty);
 
-        Debug.Log($"[GameLoop] День {currentDay} завершен! Статистика: " +
+        Debug.Log($"[GameLoop] День {currentDay - 1} завершен! Статистика: " +
                   $"Успешно: {successfulDeliveriesToday} (Заработано: {goldEarnedToday}g), " +
                   $"Провалено: {failedDeliveriesToday} (Штрафы: {goldLostToday}g). " +
                   $"Текущий общий баланс: {totalGold}g.");
@@ -304,14 +339,19 @@ public class GameLoopManager : MonoBehaviour
 
     /// <summary>
     /// Сохраняет текущее состояние игры через SaveManager. Вызывается:
-    /// - после завершения дня (FinishActiveDay)
+    /// - после завершения дня (FinishActiveDay) — уже с ИНКРЕМЕНТИРОВАННЫМ днём (v3)
     /// - при выходе в главное меню через QuitToMainMenu(saveProgress: true)
     /// - при покупке в магазине (ShopManager.FinalizePurchase / CompletePendingPurchase)
+    /// - при взятии/пропуске черновика карт (UpgradeManager.PickCard / SkipDraft, v3)
+    /// - при смене скина на зоне пола (FloorManager.ApplySkinToZone, v3.1)
     ///
-    /// ★ v2: заполняется и placedObjects — снимок расстановки мебели собирает
-    /// FurnitureSaveUtility прямо с реестра занятых ячеек сетки; и purchaseCounts —
-    /// сколько раз куплен каждый товар магазина (лимиты maxPurchaseCount переживают
-    /// перезапуск).
+    /// ★ v3: заполняется ownedUpgradeCardNames — список взятых карт по cardName
+    /// (незакрытый «шаг 5» восстановлен: раньше поле уходило в сейв ВСЕГДА пустым,
+    /// и любой выход из игры стирал все карты и их эффекты). И lastDraftDay —
+    /// защита черновика карт от перевыдачи перезапуском игры.
+    /// Также заполняются placedObjects (снимок расстановки мебели с реестра сетки)
+    /// и purchaseCounts (лимиты maxPurchaseCount переживают перезапуск).
+    /// ★ v3.1: и floorZones — скины, назначенные зонам пола (фича «Полы по зонам»).
     /// </summary>
     public void SaveCurrentProgress()
     {
@@ -326,10 +366,18 @@ public class GameLoopManager : MonoBehaviour
         {
             currentDay = currentDay,
             totalGold = totalGold,
-            // ownedUpgradeCardNames заполним в шаге 5, когда UpgradeManager получит
-            // публичный GetOwnedCardNames(). Сейчас список останется пустым,
-            // что приемлемо для базового цикла игры.
-            ownedUpgradeCardNames = new System.Collections.Generic.List<string>(),
+            // ★ v3: взятые карты — по cardName (или имени ассета, если cardName пуст).
+            // Восстанавливает их UpgradeManager.RestoreOwnedCardsFromSave() при старте
+            // сцены, повторно применяя эффекты (кроме разового золота «Задатка» —
+            // оно уже сидит в totalGold, иначе было бы удвоение).
+            ownedUpgradeCardNames = UpgradeManager.Instance != null
+                ? UpgradeManager.Instance.GetOwnedCardNames()
+                : new System.Collections.Generic.List<string>(),
+            // ★ v3: последний день с решённым черновиком карт — без него перезапуск
+            // игры перевыдавал черновик текущего дня (фарма карт выходом-заходом).
+            lastDraftDay = UpgradeManager.Instance != null
+                ? UpgradeManager.Instance.GetLastDraftResolvedDay()
+                : 0,
             // ★ v2: расстановка мебели — вся зарегистрированная в сетке
             // (и авторская, и купленная), с позициями, поворотами и itemId.
             placedObjects = FurnitureSaveUtility.CollectPlacedObjects(),
@@ -337,7 +385,13 @@ public class GameLoopManager : MonoBehaviour
             // переживают «Продолжить».
             purchaseCounts = ShopManager.Instance != null
                 ? ShopManager.Instance.GetPurchaseCountsForSave()
-                : new System.Collections.Generic.List<PurchaseCountSaveData>()
+                : new System.Collections.Generic.List<PurchaseCountSaveData>(),
+            // ★ v3.1: скины, назначенные зонам пола. FloorManager может отсутствовать
+            // в сцене (фича не размечена) — тогда пишем пустой список: при загрузке
+            // все зоны останутся с исходными материалами.
+            floorZones = FloorManager.Instance != null
+                ? FloorManager.Instance.GetFloorSaveData()
+                : new System.Collections.Generic.List<FloorZoneSkinSaveData>()
         };
 
         SaveManager.Instance.Save(data);
@@ -345,10 +399,12 @@ public class GameLoopManager : MonoBehaviour
 
     /// <summary>
     /// Переход к этапу планирования следующего дня.
+    /// ★ v3: currentDay++ отсюда УДАЛЁН — день инкрементируется в FinishActiveDay
+    /// в момент завершения дня (и сразу сохраняется). Здесь остаётся только
+    /// подготовка состояния к новому дню. Двойной инкремент исключён.
     /// </summary>
     private void StartNextDayPreparation()
     {
-        currentDay++;
         ResetDayStats();
 
         state = State.DayPreparation;
@@ -492,6 +548,15 @@ public class GameLoopManager : MonoBehaviour
 
     // Геттеры для UI
     public int GetCurrentDay() => currentDay;
+
+    /// <summary>
+    /// ★ v3: день, который ТОЛЬКО ЧТО завершён (для экрана «ИТОГИ ДНЯ N»).
+    /// Нужен потому, что currentDay теперь инкрементируется в FinishActiveDay:
+    /// на экране итогов currentDay = уже следующий день, а заголовок должен
+    /// показывать завершённый.
+    /// </summary>
+    public int GetCompletedDay() => Mathf.Max(1, currentDay - 1);
+
     public float GetCountdownToStartTimer() => countdownToStartTimer;
 
     // Финансовые геттеры для экрана результатов дня

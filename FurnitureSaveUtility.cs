@@ -43,6 +43,18 @@ using UnityEngine;
 ///
 /// Стулья DiningTable отдельно не сохраняются: они дети стола
 /// (DiningTable.Awake делает SetParent) и переезжают/поворачиваются вместе с ним.
+///
+/// ★ v1.1 (фича «Стены по рёбрам сетки»): стены с маркером WallPiece сохраняются
+/// тем же форматом PlacedObjectSaveData (имя/itemId/позиция/поворот) — ребро
+/// выводится из позиции при загрузке, поэтому СХЕМА СЕЙВА НЕ МЕНЯЛАСЬ и старые
+/// сейвы полностью совместимы. Отличия:
+/// - CollectPlacedObjects дополнительно обходит рёберный реестр стен
+///   (GridPositioningSystem.GetWallEdgesSnapshot);
+/// - в ApplySavedLayout стены не проверяются на «свободную ячейку», а на
+///   «свободное ребро»: если сохранённое ребро занято (дизайнер поставил новую
+///   стену), стена переезжает на ближайшее свободное коллинеарное ребро
+///   (GridPositioningSystem.TryRelocateWallToNearestFreeEdge) — ориентация
+///   сохраняется.
 /// </summary>
 public static class FurnitureSaveUtility
 {
@@ -86,6 +98,23 @@ public static class FurnitureSaveUtility
                 itemId = FindItemIdForCounter(counter),
                 position = counter.transform.position,
                 rotation = counter.transform.rotation
+            });
+        }
+
+        // ★ v1.1: стены живут не в ячейках, а на рёбрах — обходим рёберный реестр.
+        // Формат записи тот же: позиция середины ребра + выровненный поворот;
+        // при загрузке ребро восстанавливается из этих данных.
+        foreach (KeyValuePair<GridPositioningSystem.WallEdgeKey, BaseCounter> wallKvp in grid.GetWallEdgesSnapshot())
+        {
+            BaseCounter wall = wallKvp.Value;
+            if (wall == null) continue;
+
+            result.Add(new PlacedObjectSaveData
+            {
+                objectName = StripCloneSuffix(wall.gameObject.name),
+                itemId = FindItemIdForCounter(wall),
+                position = wall.transform.position,
+                rotation = wall.transform.rotation
             });
         }
 
@@ -241,6 +270,37 @@ public static class FurnitureSaveUtility
 
         foreach (MatchedEntry m in matched)
         {
+            // ★ v1.1: стены проверяются на свободное РЕБРО, а не ячейку.
+            if (WallPiece.IsWall(m.counter))
+            {
+                GridPositioningSystem.WallEdgeKey targetEdge =
+                    grid.DeriveWallEdgeFromCurrentPosition(m.counter);
+
+                if (!grid.IsEdgeInsideGrid(targetEdge) || !grid.IsEdgeFreeFor(targetEdge, m.counter))
+                {
+                    // Сохранённое ребро занято (дизайнер поставил новую стену) —
+                    // ищем ближайшее свободное коллинеарное ребро (радиус до 3).
+                    if (!grid.TryRelocateWallToNearestFreeEdge(m.counter))
+                    {
+                        Debug.LogError("[FurnitureSave] Для стены '" + m.counter.gameObject.name +
+                                       "' нет свободных рёбер рядом — она осталась на авторском месте и НЕ зарегистрирована.");
+                        continue;
+                    }
+
+                    Debug.LogWarning("[FurnitureSave] Стена '" + m.counter.gameObject.name +
+                                     "': сохранённое ребро занято — поставлена на ближайшее свободное.");
+                }
+                else
+                {
+                    // Ребро свободно — RegisterCounterAtCurrentPosition маршрутизирует
+                    // стену в рёберную регистрацию и точно снапнет на середину ребра.
+                    grid.RegisterCounterAtCurrentPosition(m.counter);
+                }
+
+                moved++;
+                continue;
+            }
+
             Vector2Int targetCell = grid.GetGridPosition(m.counter.transform.position);
 
             if (!grid.IsCellFreeFor(targetCell, m.counter))

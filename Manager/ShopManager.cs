@@ -64,6 +64,15 @@ using UnityEngine;
 ///   эффекты всех купленных апгрейдов — иначе после «Продолжить» счётчик покупок был,
 ///   а эффект исчезал.
 ///
+/// ★ v1.5 (фича «Полы по зонам»):
+/// - Новая категория FloorSkin: скины пола покупаются без спавна и без эффекта
+///   апгрейда — товар просто становится «собственностью» (счётчик покупок),
+///   после чего игрок назначает его зонам пола через меню полов (FloorManager, F).
+///   Связь товара со скином: ShopItemSO.itemId == FloorSkinSO.skinId.
+/// - Новый запрос GetPurchaseCountById(string) — FloorManager по нему определяет,
+///   куплен ли скин (по skinId). Ветку в ReapplyPurchasedUpgrades скины не трогают:
+///   у них upgradeEffect = None, перезапускать при загрузке сейва нечего.
+///
 /// UI: сам ShopManager НЕ рисует интерфейс. Он только хранит состояние и стреляет
 /// событиями OnShopOpened / OnShopClosed / OnItemPurchased. UI подписывается на них
 /// и обновляет карточки товаров. Это разделение позволяет менять UI без правки логики.
@@ -242,6 +251,18 @@ public class ShopManager : MonoBehaviour
     }
 
     /// <summary>
+    /// ★ v1.5: сколько раз куплен товар по itemId (строке, а не ассету).
+    /// Нужен FloorManager'у: скины пола хранятся как FloorSkinSO.skinId, который
+    /// равен itemId продавца-товара, и искать владение по строке проще, чем
+    /// поднимать ShopItemSO-ассет. Для неизвестного id возвращает 0.
+    /// </summary>
+    public int GetPurchaseCountById(string itemId)
+    {
+        if (string.IsNullOrEmpty(itemId)) return 0;
+        return purchaseCounts.TryGetValue(itemId, out int count) ? count : 0;
+    }
+
+    /// <summary>
     /// Доступен ли товар для покупки прямо сейчас: день ≥ availableFromDay И
     /// лимит покупок не исчерпан.
     /// </summary>
@@ -301,6 +322,19 @@ public class ShopManager : MonoBehaviour
             Debug.Log("[ShopManager] Сначала поставь уже купленный предмет " +
                       "(T — поставить, Escape — отменить покупку).");
             return false;
+        }
+
+        // ★ v1.5: скины пола — самый простой путь покупки: без спавна, без эффекта.
+        // Скин становится собственностью (счётчик покупок в FinalizePurchase),
+        // назначается зонам через меню полов (FloorManager, клавиша F).
+        // ВАЖНО: ветка стоит ДО апгрейдной — у скинов тоже prefab == null, и без
+        // этой ветки они падали бы в ApplyUpgradeEffect и отклонялись «за воздух».
+        if (item.category == ShopItemCategory.FloorSkin)
+        {
+            FinalizePurchase(item);
+
+            Debug.Log($"[ShopManager] Скин пола «{item.displayName}» куплен. Назначь его зонам через меню полов (клавиша F).");
+            return true;
         }
 
         // Для апгрейдов (prefab == null) — отдельный путь: применяем эффект без спавна.
@@ -784,7 +818,7 @@ public class ShopManager : MonoBehaviour
     private static T FindLiveCounter<T>() where T : BaseCounter
     {
 #if UNITY_2023_1_OR_NEWER
-          return UnityEngine.Object.FindFirstObjectByType<T>();
+        return UnityEngine.Object.FindFirstObjectByType<T>();
 #else
         T[] found = FindObjectsOfType<T>();
         return found != null && found.Length > 0 ? found[0] : null;

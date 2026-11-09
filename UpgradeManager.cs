@@ -49,6 +49,18 @@ using UnityEngine;
 /// ингредиенты из пула" гарантирует, что mutated-заказ остаётся приготовимым:
 /// подменяются лишь предметы, которые игрок берёт с ContainerCounter, а не
 /// промежуточные продукты котла/резки.
+///
+/// ★ v2 (ФИКС ВЫХОДА В МОМЕНТ ЗАВЕРШЕНИЯ ДНЯ) — карты больше не стираются выходом:
+/// - PickCard/SkipDraft сразу пишут сейв (карта + lastDraftDay) через
+///   GameLoopManager.SaveCurrentProgress();
+/// - RestoreOwnedCardsFromSave() при старте сцены восстанавливает взятые карты
+///   из сейва по cardName и ПОВТОРНО применяет их эффекты — раньше после
+///   «Продолжить» пропадали ВСЕ карты и их модификаторы (поле сейва было
+///   всегда пустым, восстановления не существовало);
+/// - разовое золото («Задаток покровителя») при восстановлении НЕ
+///   перевыдаётся — оно уже сидит в save.totalGold, иначе было бы удвоение;
+/// - lastDraftResolvedDay закрывает эксплойт «выйти-зайти ради новой раздачи»:
+///   черновик предлагается только если для текущего дня он ещё не решён.
 /// </summary>
 public class UpgradeManager : MonoBehaviour
 {
@@ -97,6 +109,14 @@ public class UpgradeManager : MonoBehaviour
     private readonly List<UpgradeCardSO> ownedCards = new List<UpgradeCardSO>();
     private readonly List<UpgradeCardSO> currentOffer = new List<UpgradeCardSO>();
 
+    /// <summary>
+    /// ★ v2: последний день, для которого черновик уже РЕШЁН (карта взята или
+    /// черновик пропущен). 0 = не решался ни для одного дня. Пишется в сейв
+    /// (GameSaveData.lastDraftDay) и мешает перевыдаче черновика после перезапуска:
+    /// без него каждый «выйти-зайти» в подготовке дня раздавал карты заново.
+    /// </summary>
+    private int lastDraftResolvedDay = 0;
+
     // Индекс карточки, подсвеченной клавиатурной навигацией A/D. Для мыши не важен:
     // клик берёт карту напрямую, подсветка лишь следует за A/D.
     private int selectedDraftIndex;
@@ -131,11 +151,23 @@ public class UpgradeManager : MonoBehaviour
         if (GameLoopManager.Instance != null)
         {
             GameLoopManager.Instance.OnDayChanged += GameLoopManager_OnDayChanged;
+        }
 
+        // ★ v2: восстановление взятых карт из сейва — ДО раздачи черновика,
+        // чтобы пул предложения уже не содержал восстановленные карты.
+        // GameLoopManager.Awake к этому моменту уже загрузил сейв (currentDay/totalGold).
+        RestoreOwnedCardsFromSave();
+
+        if (GameLoopManager.Instance != null)
+        {
             // Загрузка сейва с днём >= 2: OnDayChanged при старте не стреляет
             // (событие поднимается только при переходе на СЛЕДУЮЩИЙ день),
             // поэтому первый черновик предлагаем вручную.
-            if (GameLoopManager.Instance.IsPreparationActive() && GameLoopManager.Instance.GetCurrentDay() > 1)
+            // ★ v2: НО только если для этого дня черновик ещё НЕ решён — иначе
+            // перезапуск игры становился бы бесплатной перевыдачей карт.
+            if (GameLoopManager.Instance.IsPreparationActive() &&
+                GameLoopManager.Instance.GetCurrentDay() > 1 &&
+                GameLoopManager.Instance.GetCurrentDay() > lastDraftResolvedDay)
             {
                 RebuildChaosOrders();
                 OfferDraft();
@@ -172,7 +204,14 @@ public class UpgradeManager : MonoBehaviour
         // шли в естественном порядке: хаос → черновик.
         RebuildChaosOrders();
 
-        OfferDraft();
+        // ★ v2: страховочный гейт — при штатной смене дня условие всегда истинно
+        // (черновик решался максимум в предыдущем дне), но гейт гарантирует,
+        // что решённый черновик никогда не перевыдастся ни по какому пути.
+        if (GameLoopManager.Instance == null ||
+            GameLoopManager.Instance.GetCurrentDay() > lastDraftResolvedDay)
+        {
+            OfferDraft();
+        }
 
         // UI перестраивается в любом случае: есть карты — покажет черновик,
         // пусто — скроется (например, когда пул карт исчерпан).
@@ -359,6 +398,9 @@ public class UpgradeManager : MonoBehaviour
     /// Взять карту по индексу предложения. Общий путь для мыши (гримуар) и клавиатуры
     /// (E после A/D). По завершении очищает currentOffer и стреляет OnOfferChanged —
     /// UI скроется сам, а Player разблокирует персонажа (гейт IsDraftActive отпустит).
+    /// ★ v2: выбор карты СРАЗУ фиксируется в сейве — раньше карта жила только в
+    /// памяти сцены, и выход из игры (особенно в момент завершения дня, когда карта
+    /// только что взята) стирал её безвозвратно.
     /// </summary>
     public void PickCard(int index)
     {
@@ -370,23 +412,54 @@ public class UpgradeManager : MonoBehaviour
         ownedCards.Add(picked);
         currentOffer.Clear();
 
+        MarkDraftResolvedAndSave();
+
         Debug.Log($"[UpgradeManager] Взята карта: {picked.cardName}.");
         OnOfferChanged?.Invoke(this, EventArgs.Empty);
     }
 
     /// <summary>
     /// Пропустить черновик: карта не берётся, предложение закрывается до следующего дня.
+    /// ★ v2: скип тоже пишется в сейв — иначе после перезапуска черновик перевыдался
+    /// бы, и «скип» превращался в «переброс раздачи» бесконечно.
     /// </summary>
     public void SkipDraft()
     {
         if (currentOffer.Count == 0) return;
 
         currentOffer.Clear();
+
+        MarkDraftResolvedAndSave();
+
         Debug.Log("[UpgradeManager] Черновик пропущен — карты дня остались невзятыми.");
         OnOfferChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    private void ApplyEffect(UpgradeCardSO card)
+    /// <summary>
+    /// ★ v2: помечает черновик текущего дня решённым и немедленно сохраняет прогресс.
+    /// Общий хвост PickCard и SkipDraft. Сейв здесь безопасен: мы в фазе подготовки
+    /// (гейт в PickCard), расстановка мебели и счётчики магазина в консистентном
+    /// состоянии — тот же путь, что и при покупке в магазине.
+    /// </summary>
+    private void MarkDraftResolvedAndSave()
+    {
+        if (GameLoopManager.Instance == null) return;
+
+        lastDraftResolvedDay = GameLoopManager.Instance.GetCurrentDay();
+        GameLoopManager.Instance.SaveCurrentProgress();
+    }
+
+    /// <summary>
+    /// Применяет эффект карты.
+    /// ★ v2: параметр restoring — режим восстановления из сейва (RestoreOwnedCardsFrom
+    /// Save). В этом режиме пропускаются НЕИДЕМПОТЕНТНЫЕ эффекты, чей результат уже
+    /// лежит в сейве отдельно от списка карт: сейчас это только разовое золото
+    /// «Задатка покровителя» (сумма уже учтена в save.totalGold — GameLoopManager
+    /// загрузил её раньше). Все остальные эффекты — аддитивные модификаторы поверх
+    /// дефолтных значений свежесозданных компонентов сцены — повторно применяются,
+    /// чтобы модификаторы не терялись после «Продолжить».
+    /// </summary>
+    private void ApplyEffect(UpgradeCardSO card, bool restoring = false)
     {
         switch (card.effectType)
         {
@@ -417,7 +490,10 @@ public class UpgradeManager : MonoBehaviour
                 break;
 
             case UpgradeEffectType.BonusGold:
-                if (GameLoopManager.Instance != null)
+                // Задаток покровителя — разовая прибавка золота В МОМЕНТ взятия карты.
+                // ★ v2: при восстановлении из сейва НЕ перевыдаётся — сумма уже
+                // сидит в save.totalGold, иначе «Продолжить» удваивало бы бонус.
+                if (!restoring && GameLoopManager.Instance != null)
                     GameLoopManager.Instance.AddBonusGold(Mathf.RoundToInt(card.value));
                 break;
 
@@ -619,4 +695,85 @@ public class UpgradeManager : MonoBehaviour
 
     public List<UpgradeCardSO> GetOwnedCards() => ownedCards;
     public List<UpgradeCardSO> GetCurrentOffer() => currentOffer;
+
+    /// <summary>★ v2: последний день с решённым черновиком (для GameSaveData.lastDraftDay).</summary>
+    public int GetLastDraftResolvedDay() => lastDraftResolvedDay;
+
+    /// <summary>
+    /// ★ v2: имена взятых карт для сейва (GameLoopManager.SaveCurrentProgress).
+    /// Сохраняем по cardName; если у ассета cardName пуст — по имени ассета.
+    /// RestoreOwnedCardsFromSave понимает оба варианта.
+    /// </summary>
+    public List<string> GetOwnedCardNames()
+    {
+        List<string> names = new List<string>();
+
+        foreach (UpgradeCardSO card in ownedCards)
+        {
+            if (card == null) continue;
+            names.Add(!string.IsNullOrEmpty(card.cardName) ? card.cardName : card.name);
+        }
+
+        return names;
+    }
+
+    /// <summary>
+    /// ★ v2: восстановление взятых карт из сейва при старте сцены.
+    /// Раньше этого метода не существовало вовсе, а ownedUpgradeCardNames в сейве
+    /// всегда был пустым («шаг 5») — любой выход из игры стирал все карты и их
+    /// эффекты. Теперь:
+    /// 1) lastDraftResolvedDay читается из сейва — решённый черновик не перевыдаётся;
+    /// 2) карты сопоставляются с каталогом upgradeCardListSO по cardName/имени ассета;
+    /// 3) эффекты повторно применяются (restoring: true) — модификаторы скорости,
+    ///    терпения, штрафов и т.д. переживают «Продолжить»; разовое золото
+    ///    «Задатка» не перевыдаётся (уже в totalGold).
+    /// Вызывается из Start() ДО раздачи черновика — пул предложения не содержит
+    /// уже взятых карт.
+    /// </summary>
+    private void RestoreOwnedCardsFromSave()
+    {
+        if (SaveManager.Instance == null || !SaveManager.Instance.HasSave()) return;
+
+        GameSaveData save = SaveManager.Instance.GetCurrentSave();
+        if (save == null) return;
+
+        lastDraftResolvedDay = save.lastDraftDay;
+
+        if (save.ownedUpgradeCardNames == null || save.ownedUpgradeCardNames.Count == 0)
+        {
+            return;
+        }
+
+        if (upgradeCardListSO == null || upgradeCardListSO.upgradeCardSOList == null)
+        {
+            Debug.LogWarning("[UpgradeManager] В сейве есть карты, но upgradeCardListSO не назначен в инспекторе — восстановить карты нельзя.");
+            return;
+        }
+
+        int restoredCount = 0;
+
+        foreach (string savedName in save.ownedUpgradeCardNames)
+        {
+            if (string.IsNullOrEmpty(savedName)) continue;
+
+            UpgradeCardSO card = upgradeCardListSO.upgradeCardSOList.Find(c =>
+                c != null && (c.cardName == savedName || c.name == savedName));
+
+            if (card == null)
+            {
+                Debug.LogWarning($"[UpgradeManager] Карта '{savedName}' из сейва не найдена в каталоге карт — пропущена.");
+                continue;
+            }
+
+            // Защита от дублей в сейве: карта уже восстановлена — эффект повторно не применяем.
+            if (ownedCards.Contains(card)) continue;
+
+            ownedCards.Add(card);
+            ApplyEffect(card, restoring: true);
+            restoredCount++;
+        }
+
+        Debug.Log($"[UpgradeManager] Восстановлено карт из сейва: {restoredCount} " +
+                  $"(черновик решён для дня: {lastDraftResolvedDay}).");
+    }
 }

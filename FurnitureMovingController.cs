@@ -69,6 +69,20 @@ using System.Collections.Generic;
 ///
 /// После ЛЮБОЙ постановки мебели ВСЕ столы сцены перепроверяют своих стульев
 /// (RecheckAllTableChairs): поставленная мебель могла перекрыть чужой стул.
+///
+/// ★ v2.4 (фича «Стены по рёбрам сетки» — прилипание между клеток и к друг другу):
+/// - Предметы с маркером WallPiece (стены) переносятся по-особому: призрак
+///   прилипает не к центрам ячеек, а к РЁБРАМ сетки — границам МЕЖДУ клетками,
+///   и его длинная ось автоматически ложится вдоль ребра (0/90°).
+/// - ПРИЛИПАНИЕ «К ДРУГ ДРУГУ»: соседние коллинеарные рёбра дают точный стык
+///   торцами, перпендикулярные встречаются в узле; плюс магнит — ребро рядом
+///   с уже стоящей стеной «притягивает» призрак (×0.5 к дистанции), и линия
+///   стен продолжается естественно.
+/// - R у стены переключает принудительную ориентацию: авто → вдоль X → вдоль Z
+///   (у обычной мебели R по-прежнему крутит призрак на rotationStepDegrees).
+/// - Конфликт «две стены на одном ребре» ловит рёберный реестр сетки;
+///   лёгкое касание стен друг другом при стыковке физикой НЕ блокируется.
+/// - Постановка купленной стены из лавки идёт по тому же рёберному пути.
 /// </summary>
 public class FurnitureMovingController : MonoBehaviour
 {
@@ -186,6 +200,15 @@ public class FurnitureMovingController : MonoBehaviour
     // а не возвращает его на исходное место.
     private ShopItemSO purchasedItemContext;
 
+    // ★ v2.4: стена-призрак. isMovingWall включает рёберный режим снапа;
+    // lastSnappedEdge/hasSnappedEdge — ребро, на которое призрак прилип сейчас;
+    // wallOrientationOverride — принудительная ориентация (R): 0 авто,
+    // 1 = только AlongX, 2 = только AlongZ.
+    private bool isMovingWall;
+    private GridPositioningSystem.WallEdgeKey lastSnappedEdge;
+    private bool hasSnappedEdge;
+    private int wallOrientationOverride;
+
     /// <summary>★ v2.3: идёт ли сейчас постановка купленного в магазине предмета.</summary>
     public bool IsPlacingPurchase => purchasedItemContext != null;
 
@@ -238,9 +261,18 @@ public class FurnitureMovingController : MonoBehaviour
             UpdateGhostPosition();
 
             // ★ v2.3: поворот работает и при переносе, и при постановке покупки.
+            // ★ v2.4: у стены R не крутит призрак — переключает принудительную
+            // ориентацию ребра (у стены поворот диктует само ребро).
             if (Input.GetKeyDown(rotateFurnitureKey))
             {
-                RotateGhost();
+                if (isMovingWall)
+                {
+                    CycleWallOrientationOverride();
+                }
+                else
+                {
+                    RotateGhost();
+                }
             }
 
             if (Input.GetKeyDown(moveFurnitureKey))
@@ -404,6 +436,11 @@ public class FurnitureMovingController : MonoBehaviour
         originalWorldPosition = instance.transform.position;
         capturedRotation = instance.transform.rotation;
 
+        // ★ v2.4: купленная стена ставится по рёбрам — как и переносимая.
+        isMovingWall = WallPiece.IsWall(instance);
+        wallOrientationOverride = 0;
+        hasSnappedEdge = false;
+
         // Купленному столу глушим NavMeshObstacle на время призрака — та же
         // логика, что при обычном переносе. При отмене obstacle умрёт вместе
         // с объектом, при подтверждении вернётся штатно.
@@ -468,6 +505,11 @@ public class FurnitureMovingController : MonoBehaviour
 
         movingCounter = selectedCounter;
         originalWorldPosition = selectedCounter.transform.position;
+
+        // ★ v2.4: стены — особый режим призрака (рёбра сетки вместо ячеек).
+        isMovingWall = WallPiece.IsWall(selectedCounter);
+        wallOrientationOverride = 0;
+        hasSnappedEdge = false;
 
         // ★ v2.3: фиксируем ориентацию на момент подъёма — от неё считается
         // дельта поворота проверочного бокса (см. GetCurrentBoxRotation).
@@ -631,6 +673,13 @@ public class FurnitureMovingController : MonoBehaviour
             return;
         }
 
+        // ★ v2.4: стены прилипают к рёбрам — свой путь призрака.
+        if (isMovingWall)
+        {
+            UpdateWallGhostPosition();
+            return;
+        }
+
         Vector3 aheadPoint =
             Player.Instance.transform.position +
             Player.Instance.transform.forward * placementDistance;
@@ -673,6 +722,182 @@ public class FurnitureMovingController : MonoBehaviour
             !IsPlacementBlocked(ghostPosition);
 
         ApplyGhostTint(placeable);
+    }
+
+    // ============================================================
+    //  ★ v2.4: СТЕНЫ — ПРИЛИПАНИЕ К РЁБРАМ СЕТКИ
+    // ============================================================
+
+    /// <summary>
+    /// Циклит принудительную ориентацию стены: авто → только вдоль X → только
+    /// вдоль Z → авто. Нажимается R — у стены обычный поворот бессмыслен:
+    /// ориентацию диктует само ребро, R лишь подсказывает системе, какой тип
+    /// рёбер предпочесть в спорных случаях.
+    /// </summary>
+    private void CycleWallOrientationOverride()
+    {
+        wallOrientationOverride = (wallOrientationOverride + 1) % 3;
+
+        string mode = wallOrientationOverride == 0
+            ? "авто (ближайшее ребро)"
+            : wallOrientationOverride == 1
+                ? "только продольные (вдоль X)"
+                : "только поперечные (вдоль Z)";
+
+        Debug.Log($"[FurnitureMoving] Ориентация стены: {mode}.");
+    }
+
+    /// <summary>
+    /// Призрак стены: прилипает к ближайшему свободному РЕБРУ сетки (границе
+    /// между клетками) с магнитом к продолжению линий стен, длинная ось
+    /// автоматически ложится вдоль ребра. Геометрический центр садится точно
+    /// на середину ребра — работает с любым пивотом префаба (wallBoxOffset).
+    /// </summary>
+    private void UpdateWallGhostPosition()
+    {
+        if (Player.Instance == null || !EnsureGrid())
+        {
+            return;
+        }
+
+        Vector3 aheadPoint =
+            Player.Instance.transform.position +
+            Player.Instance.transform.forward * placementDistance;
+
+        if (!grid.TrySnapWorldToWallEdge(aheadPoint, movingCounter, wallOrientationOverride, out GridPositioningSystem.WallEdgeKey edge))
+        {
+            // Свободного ребра рядом нет — призрак замирает на последнем
+            // корректном месте (та же философия, что у клеток: подтверждать
+            // нельзя, но и телепортировать в невалид ничего не нужно).
+            hasSnappedEdge = false;
+            ApplyGhostTint(false);
+            return;
+        }
+
+        lastSnappedEdge = edge;
+        hasSnappedEdge = true;
+
+        // Поворот: длинная ось вдоль ребра. Ставим ПЕРЕД расчётом оффсета —
+        // GetCurrentBoxRotation() считается от актуального поворота призрака.
+        bool edgeAlongX = edge.axis == GridPositioningSystem.WallEdgeAxis.AlongX;
+        movingCounter.transform.rotation = Quaternion.Euler(0f, GetWallAlignedYaw(edgeAlongX), 0f);
+
+        // Позиция: геометрический центр стены на середину ребра.
+        Vector3 midpoint = grid.GetWallEdgeMidpoint(edge);
+        Vector3 centerOffset = GetCurrentBoxRotation() * wallBoxOffset;
+
+        movingCounter.transform.position = new Vector3(
+            midpoint.x - centerOffset.x,
+            originalWorldPosition.y,
+            midpoint.z - centerOffset.z);
+
+        // Честная валидность для подсветки: ребро свободно И физика ни во что не упирается.
+        bool placeable =
+            grid.IsEdgeFreeFor(edge, movingCounter) &&
+            !IsPlacementBlocked(movingCounter.transform.position);
+
+        ApplyGhostTint(placeable);
+    }
+
+    /// <summary>
+    /// Yaw, при котором длинная ось стены ложится вдоль ребра (AlongX → 0/180,
+    /// AlongZ → 90/270). Длинная ось берётся из захваченного проверочного бокса
+    /// (wallBoxHalfExtents) с поправкой на захваченный поворот — работает и для
+    /// префабов, authored под 90/180/270.
+    /// </summary>
+    private float GetWallAlignedYaw(bool edgeAlongX)
+    {
+        bool longIsXAtCapture = wallBoxHalfExtents.x >= wallBoxHalfExtents.z;
+
+        float capturedYaw = capturedRotation.eulerAngles.y % 360f;
+        if (capturedYaw < 0f) capturedYaw += 360f;
+
+        int quarter = Mathf.RoundToInt(capturedYaw / 90f);
+        bool longWasWorldX = (quarter % 2 == 0) == longIsXAtCapture;
+
+        float alignedYaw = quarter * 90f;
+
+        if (longWasWorldX != edgeAlongX)
+        {
+            alignedYaw += 90f;
+        }
+
+        return alignedYaw;
+    }
+
+    /// <summary>
+    /// Подтверждение места стены: ребро свободно (рёберный реестр), внутри
+    /// сетки, физика не против (статичные стены/мебель). Дальше конвейер общий:
+    /// NavMeshObstacle стола, оплата покупки, звук.
+    /// </summary>
+    private void TryConfirmWallPlacement()
+    {
+        if (!EnsureGrid())
+        {
+            Debug.LogWarning("[FurnitureMoving] GridPositioningSystem не найден — стену поставить нельзя.");
+            return;
+        }
+
+        if (!hasSnappedEdge ||
+            !grid.IsEdgeInsideGrid(lastSnappedEdge) ||
+            !grid.IsEdgeFreeFor(lastSnappedEdge, movingCounter))
+        {
+            Debug.Log("[FurnitureMoving] Это ребро занято другой стеной или вне сетки — выбери другое место.");
+
+            PlaySoundAt(blockedSound, movingCounter.transform.position);
+            return;
+        }
+
+        if (IsPlacementBlocked(movingCounter.transform.position))
+        {
+            LogBlockedPlacementReason(movingCounter.transform.position);
+
+            Debug.Log("[FurnitureMoving] Здесь стену ставить нельзя — пересечение со стеной или мебелью.");
+
+            PlaySoundAt(blockedSound, movingCounter.transform.position);
+            return;
+        }
+
+        Vector3 confirmPos = movingCounter.transform.position;
+
+        if (grid.TryPlaceWall(movingCounter, lastSnappedEdge))
+        {
+            Debug.Log("[FurnitureMoving] Стена встала на ребро и прилипла к соседям.");
+
+            if (liftedTableWithObstacle != null)
+            {
+                liftedTableWithObstacle.EnableNavMeshObstacle();
+                liftedTableWithObstacle = null;
+            }
+
+            FinishMoving();
+
+            // ★ v2.3 (перенесено в стеновой путь): если это была ПОКУПКА —
+            // только теперь списываем золото (ShopManager.CompletePendingPurchase).
+            if (purchasedItemContext != null)
+            {
+                ShopItemSO purchased = purchasedItemContext;
+                purchasedItemContext = null;
+
+                if (ShopManager.Instance != null)
+                {
+                    ShopManager.Instance.CompletePendingPurchase(purchased);
+                }
+                else
+                {
+                    Debug.LogError("[FurnitureMoving] ShopManager не найден — не удалось списать золото " +
+                                   $"за '{purchased.displayName}'. Стена остаётся у игрока бесплатно.");
+                }
+            }
+
+            PlaySoundAt(placeSound, confirmPos);
+        }
+        else
+        {
+            Debug.Log("[FurnitureMoving] Это ребро занято — выбери другое место.");
+
+            PlaySoundAt(blockedSound, confirmPos);
+        }
     }
 
     /// <summary>
@@ -770,6 +995,13 @@ public class FurnitureMovingController : MonoBehaviour
     {
         if (movingCounter == null)
         {
+            return;
+        }
+
+        // ★ v2.4: стены подтверждаются по рёбрам — отдельный путь.
+        if (isMovingWall)
+        {
+            TryConfirmWallPlacement();
             return;
         }
 
@@ -1065,6 +1297,14 @@ public class FurnitureMovingController : MonoBehaviour
 
             if (otherCounter != null && otherCounter != movingCounter)
             {
+                // ★ v2.4: стены стыкуются друг с другом (торцы и углы) — их
+                // касание при стыковке НЕ блокирует постановку. Конфликт
+                // «две стены на одном ребре» ловит рёберный реестр сетки.
+                if (WallPiece.IsWall(otherCounter))
+                {
+                    continue;
+                }
+
                 lastFurnitureHit = hit;
                 return true;
             }
@@ -1191,6 +1431,13 @@ public class FurnitureMovingController : MonoBehaviour
         {
             movingCounter.transform.position = originalWorldPosition;
 
+            // ★ v2.4: возвращаем и поворот. Для стен это критично: призрак
+            // выравнивает длинную ось по НАЖАТОМУ ребру, и без возврата стена
+            // легла бы обратно на своё ребро, но развёрнутой поперёк — реестр
+            // и геометрия разошлись бы. Заодно чинится старый quirк обычной
+            // мебели: поворот по R больше не остаётся после отмены.
+            movingCounter.transform.rotation = capturedRotation;
+
             Debug.Log(
                 $"[FurnitureMoving] Перенос отменён, '{movingCounter.name}' вернулся на место.");
         }
@@ -1227,5 +1474,10 @@ public class FurnitureMovingController : MonoBehaviour
         hasBlockedCell = false;
         lastWallHit = null;
         lastFurnitureHit = null;
+
+        // ★ v2.4: сброс стенового режима.
+        isMovingWall = false;
+        hasSnappedEdge = false;
+        wallOrientationOverride = 0;
     }
 }
