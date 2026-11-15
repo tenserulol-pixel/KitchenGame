@@ -326,7 +326,16 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         {
             if (raycastHit.transform.TryGetComponent<BaseCounter>(out BaseCounter baseCounter))
             {
-                if (baseCounter != selectedCounter)
+                // ★ ФИКС «сквозь стену» (часть 1): станция выделяется, только если на пути
+                // луча до неё нет СПЛОШНОЙ преграды (стена, другая мебель). Первый луч бьёт
+                // только по слою Counters и пролетает СКВОЗЬ стену, стоящую на другом слое
+                // (или над щелью под её коллайдером) — раньше за стеной спокойно выделялась
+                // станция, после чего автопритяжение утаскивало игрока сквозь стену к ней.
+                if (HasSolidObstacleBeforeCounter(raycastHit.collider, raycastHit.distance))
+                {
+                    SetSelectedCounter(null);
+                }
+                else if (baseCounter != selectedCounter)
                 {
                     SetSelectedCounter(baseCounter);
                 }
@@ -340,6 +349,44 @@ public class Player : MonoBehaviour, IKitchenObjectParent
         {
             SetSelectedCounter(null);
         }
+    }
+
+    /// <summary>
+    /// ★ ФИКС «сквозь стену» (часть 1): true, если на пути луча взаимодействия до станции
+    /// есть сплошной коллайдер, НЕ принадлежащий самой станции. Триггеры (датчики, зоны)
+    /// преградой НЕ считаются — луч перепрыгивает их и проверяет, что стоит дальше.
+    /// Слои — все непрозрачные для луча (DefaultRaycastLayers): преградой считается
+    /// препятствие на ЛЮБОМ слое, а не только на Counters.
+    /// </summary>
+    private bool HasSolidObstacleBeforeCounter(Collider targetCollider, float targetDistance)
+    {
+        Vector3 current = transform.position;
+        float remaining = targetDistance - 0.05f; // запас, чтобы не ловить собственную поверхность станции
+
+        // До 4 перепрыгиваний триггеров подряд — с запасом хватает для игровой сцены.
+        for (int i = 0; i < 4 && remaining > 0.01f; i++)
+        {
+            if (!Physics.Raycast(current, lastInteractDir, out RaycastHit blocker, remaining,
+                                 Physics.DefaultRaycastLayers, QueryTriggerInteraction.Collide))
+            {
+                return false; // до точки попадания — ничего сплошного
+            }
+
+            if (blocker.collider.isTrigger)
+            {
+                // Триггер — не преграда: продолжаем луч сразу за ним.
+                float skip = blocker.distance + 0.02f;
+                current += lastInteractDir * skip;
+                remaining -= skip;
+                continue;
+            }
+
+            // Сплошной коллайдер. Он НЕ преграда, только если это сама станция
+            // или её дети (составной коллайдер прилавка/лужи/стола).
+            return !blocker.collider.transform.IsChildOf(targetCollider.transform);
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -398,7 +445,33 @@ public class Player : MonoBehaviour, IKitchenObjectParent
 
         idealPosition.y = transform.position.y; // высоту не трогаем
 
-        transform.position = Vector3.MoveTowards(transform.position, idealPosition, snapMoveSpeed * Time.deltaTime);
+        // ★ ФИКС «сквозь стену» (часть 2): притяжение — такое же физическое движение,
+        // как ходьба, поэтому каждый шаг к идеальной точке сначала проверяется капсульным
+        // кастом (та же геометрия, что в HandleMovement). Раньше MoveTowards двигал
+        // позицию напрямую без проверок: станция, выделенная (или оставшаяся выбранной)
+        // за стеной, утаскивала игрока сквозь эту стену.
+        Vector3 nextPosition = Vector3.MoveTowards(transform.position, idealPosition, snapMoveSpeed * Time.deltaTime);
+
+        Vector3 toNext = nextPosition - transform.position;
+        toNext.y = 0f;
+
+        if (toNext.sqrMagnitude > 0.0001f)
+        {
+            bool pullPathBlocked = Physics.CapsuleCast(
+                transform.position,
+                transform.position + Vector3.up * playerHeight,
+                playerRadius,
+                toNext.normalized,
+                toNext.magnitude
+            );
+
+            if (!pullPathBlocked)
+            {
+                transform.position = nextPosition;
+            }
+            // Путь заблокирован — стоим на месте: доворот лицом к станции ниже всё равно
+            // случится, а подойти игрок может сам (ходьба со скольжением вдоль стены).
+        }
 
         Vector3 lookDir = counterCenter - transform.position;
         lookDir.y = 0f;

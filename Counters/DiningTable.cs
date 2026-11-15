@@ -36,6 +36,12 @@ public class DiningTable : BaseCounter
     private int finishedEatingCountCached = 0; // Сколько гостей реально поели (для точного количества посуды)
     private int dirtyPlatesCount = 0; // Сколько грязных тарелок сейчас физически находится на столе
 
+    // ★ Подача без тарелки (needsPlate == false): гости, которым блюдо отдали
+    // «голыми руками» — зелья и т.п. Посуды у них не было, значит и грязной
+    // тарелки после еды за них на стол не появляется.
+    private readonly List<CustomerAI> platelessCustomers = new List<CustomerAI>();
+    private int platelessFinishedEatingCount = 0; // из них уже поели — вычитается из стопки посуды
+
     // FIX: флаг «группа за этим столом уже полностью ушла и стол приведён в порядок».
     // Без него вложенные вызовы OnCustomerLeft (каскад «один уходит — все уходят»)
     // выполняли блок очистки НЕСКОЛЬКО раз: второй проход видел finishedEatingCountCached == 0
@@ -197,6 +203,8 @@ public class DiningTable : BaseCounter
         currentCustomers.Clear();
         finishedEatingCustomers.Clear();
         finishedEatingCountCached = 0;
+        platelessCustomers.Clear();
+        platelessFinishedEatingCount = 0;
         groupCleanupDone = false; // FIX: новая группа — снова разрешаем однократную очистку
 
         // КАРТЫ: сброс состояния группы. pendingSeatCount = размер группы —
@@ -231,6 +239,19 @@ public class DiningTable : BaseCounter
     {
         if (customer == null) return;
 
+        // === ТИП «КОБОЛЬД»: вся группа заказывает ОДНО блюдо ===
+        // Кобольды спавнятся только группой (CustomerManager.GetGroupSizeForType),
+        // поэтому за столом они всегда сидят со своими: currentCustomers[0] — первый
+        // севший член этой же группы. Зеркалим ДО добавления в список и ДО того,
+        // как SitDown покажет пузырь и зарегистрирует заказ — и визуал, и список
+        // заказов получат уже общий рецепт.
+        // Карта «Общий заказ» при этом для кобольдов не нужна — они и так всегда
+        // берут общий заказ, поэтому карта зеркалит только остальных.
+        if (customer.GetCustomerType() == CustomerAI.CustomerType.Kobold
+            && currentCustomers.Count > 0)
+        {
+            customer.MirrorOrderFrom(currentCustomers[0]);
+        }
         // === КАРТА «Общий заказ» ===
         // С вероятностью value (0..1) гость берёт то же блюдо, что и первый севший
         // за этот стол. Меняем заказ ДО добавления гостя в список и ДО того, как
@@ -238,7 +259,7 @@ public class DiningTable : BaseCounter
         // DeliveryManager — визуал и список заказов получат уже согласованный рецепт.
         // Синергия с «Большие порции»: зеркальная группа + доп. блюдо, скопированное
         // с заказов гостей = серия одинаковых блюд за один прогон по кухне.
-        if (currentCustomers.Count > 0
+        else if (currentCustomers.Count > 0
             && DeliveryManager.HasUpgrade(UpgradeEffectType.SameDishChance))
         {
             float mirrorChance = DeliveryManager.GetUpgradeValue(UpgradeEffectType.SameDishChance);
@@ -351,6 +372,7 @@ public class DiningTable : BaseCounter
 
         currentCustomers.Remove(customer);
         finishedEatingCustomers.Remove(customer);
+        platelessCustomers.Remove(customer); // ★ пометку «ел без тарелки» уводим вместе с гостем
 
         // Защита: если СИДЯЩИЙ гость уходит (например, разозлился) — принудительно
         // уводим всю оставшуюся группу. Отказавшегося от места «ходока» — не трогаем.
@@ -376,11 +398,25 @@ public class DiningTable : BaseCounter
             // Если хотя бы один клиент за столом успел покушать — стол становится грязным
             if (finishedEatingCountCached > 0)
             {
-                SetDirty();
-                // Спавним стопку грязных тарелок по количеству реально покушавших гостей
-                // (доп. порции «Больших порций» тоже оставляют грязную тарелку)
-                SpawnDirtyPlatesStack(finishedEatingCountCached);
+                // ★ Подача без тарелки: поевшие «голыми руками» посуды не оставляют —
+                // вычитаем их из стопки. Все ели без тарелки — стол сразу чистый.
+                int dirtyPlates = Mathf.Max(0, finishedEatingCountCached - platelessFinishedEatingCount);
+
+                if (dirtyPlates > 0)
+                {
+                    SetDirty();
+                    // Стопка по количеству поевших НА ТАРЕЛКЕ
+                    // (доп. порции «Больших порций», поданные на тарелке, тоже оставляют посуду)
+                    SpawnDirtyPlatesStack(dirtyPlates);
+                }
+                else
+                {
+                    // Ели только без тарелки (зелья и т.п.) — грязной посуды нет вовсе
+                    CleanTable();
+                }
+
                 finishedEatingCountCached = 0;
+                platelessFinishedEatingCount = 0;
             }
             else
             {
@@ -396,6 +432,13 @@ public class DiningTable : BaseCounter
         {
             finishedEatingCustomers.Add(customer);
             finishedEatingCountCached++;
+
+            // ★ Подача без тарелки: этот гость посуду не использовал —
+            // в стопку грязных тарелок он не попадёт.
+            if (platelessCustomers.Contains(customer))
+            {
+                platelessFinishedEatingCount++;
+            }
         }
 
         // Если абсолютно все сидящие за столом гости закончили кушать.
@@ -443,25 +486,68 @@ public class DiningTable : BaseCounter
         dirtyPlatesCount = 0;
     }
 
-    public bool TryServe(RecipeSO recipeSO)
+    /// <summary>
+    /// ★ Подача без тарелки: servedOnPlate == false — поевший гость посуду не
+    /// использовал, и после еды за него НЕ появляется грязная тарелка.
+    /// Правило «безтарельное блюдо — без посуды» действует для ЛЮБОГО способа
+    /// подачи: и «голыми руками» (DeliveryManager.TryDeliverLooseItemToTable),
+    /// и когда зелье привезли на тарелке (гость пьёт из бутылки — тарелка
+    /// остаётся чистой; флаг передаёт TryDeliverRecipeToTable по needsPlate).
+    /// Доп. блюда «Больших порций» считаются так же: на тарелке — посуда,
+    /// без неё (или needsPlate == false) — нет.
+    /// </summary>
+    public bool TryServe(RecipeSO recipeSO, bool servedOnPlate = true)
     {
-        foreach (CustomerAI customer in currentCustomers)
+        // Итерируем по СНИМКУ списка: призрак после последнего заказа уходит ПРЯМО
+        // отсюда (TryDeliver → DeliverOrder → LeaveTable → OnCustomerLeft), и это
+        // модифицирует currentCustomers прямо во время перебора — foreach по живому
+        // списку упал бы с InvalidOperationException. Для гоблинов/кобольдов снимок
+        // тоже не мешает: уход после еды происходит позже, из Update, а не отсюда.
+        List<CustomerAI> serveSnapshot = new List<CustomerAI>(currentCustomers);
+        foreach (CustomerAI customer in serveSnapshot)
         {
+            if (customer == null) continue;
+
             if (customer.TryDeliver(recipeSO))
             {
+                // ★ Без тарелки: помечаем едока — грязной тарелки за ним не будет.
+                // ЗАЩИТА от «мёртвой» пометки: призрак с последним заказом уходит
+                // ПРЯМО из TryDeliver (LeaveTable → OnCustomerLeft → CleanTable),
+                // и списки группы к этому моменту уже обнулены — помечать ушедшего
+                // нельзя, иначе в platelessCustomers останется мусор до следующей
+                // группы (OccupyTable его чистит, но копить мусор незачем).
+                if (!servedOnPlate
+                    && currentCustomers.Contains(customer)
+                    && !platelessCustomers.Contains(customer))
+                {
+                    platelessCustomers.Add(customer);
+                }
+
                 return true;
             }
         }
 
         // === КАРТА «Большие порции»: подача доп. блюда группы ===
         // У доп. порции нет конкретного едока — считаем её поданной, если рецепт
-        // совпал с одним из невыданных доп. блюд. Каждая поданная доп. порция
-        // оставляет после себя грязную тарелку (finishedEatingCountCached++).
+        // совпал с одним из невыданных доп. блюд. Поданная НА ТАРЕЛКЕ доп. порция
+        // оставляет после себя грязную тарелку (finishedEatingCountCached++),
+        // поданная «голыми руками» — нет (platelessFinishedEatingCount++).
         int extraIndex = extraPortionOrders.IndexOf(recipeSO);
         if (extraIndex >= 0)
         {
             extraPortionOrders.RemoveAt(extraIndex);
-            finishedEatingCountCached++;
+
+            // Поданная на тарелке доп. порция оставляет грязную тарелку,
+            // поданная «голыми руками» — нет (как и у обычных гостей).
+            if (servedOnPlate)
+            {
+                finishedEatingCountCached++;
+            }
+            else
+            {
+                platelessFinishedEatingCount++;
+            }
+
             Debug.Log($"[DiningTable] «Большие порции»: доп. блюдо ({recipeSO.RecipeName}) подано на стол '{name}'. Осталось доп. блюд: {extraPortionOrders.Count}.");
             return true;
         }
@@ -494,15 +580,15 @@ public class DiningTable : BaseCounter
                 return;
             }
 
-            if (!player.GetKitchenObject().TryGetPlate(out PlateKitchenObject plateKitchenObject))
+            if (DeliveryManager.Instance == null)
             {
-                Debug.Log("[DiningTable] В руках не тарелка — подать заказ нельзя.");
+                Debug.LogWarning("[DiningTable] DeliveryManager.Instance == null — подача невозможна!");
                 return;
             }
 
-            // Передаем проверку и доставку менеджеру доставки
-            if (DeliveryManager.Instance != null)
+            if (player.GetKitchenObject().TryGetPlate(out PlateKitchenObject plateKitchenObject))
             {
+                // Обычная подача на тарелке: менеджер сверит содержимое тарелки с заказом стола
                 if (DeliveryManager.Instance.TryDeliverRecipeToTable(plateKitchenObject, this))
                 {
                     // Золото начисляется внутри DeliveryManager.TryDeliverRecipeToTable —
@@ -516,7 +602,22 @@ public class DiningTable : BaseCounter
             }
             else
             {
-                Debug.LogWarning("[DiningTable] DeliveryManager.Instance == null — подача невозможна!");
+                // Подача БЕЗ тарелки: предмет в руках и есть блюдо целиком (зелья и т.п.).
+                // Сработает, только если заказ стола имеет needsPlate == false и состоит
+                // ровно из одного ингредиента, совпадающего с предметом (см. DeliveryManager).
+                KitchenObject looseItem = player.GetKitchenObject();
+                KitchenObjectSO looseSO = looseItem.GetKitchenObjectSo();
+                string looseName = looseSO != null ? looseSO.name : looseItem.name;
+
+                if (DeliveryManager.Instance.TryDeliverLooseItemToTable(looseItem, this))
+                {
+                    Debug.Log("Заказ без тарелки успешно передан клиенту за столом!");
+                }
+                else
+                {
+                    Debug.Log($"[DiningTable] '{looseName}' не принят за столом '{name}': без тарелки подаются " +
+                              "только заказы с needsPlate == false и ровно одним ингредиентом.");
+                }
             }
             return;
         }
@@ -583,6 +684,8 @@ public class DiningTable : BaseCounter
         currentCustomers.Clear();
         finishedEatingCustomers.Clear();
         finishedEatingCountCached = 0;
+        platelessCustomers.Clear();
+        platelessFinishedEatingCount = 0;
         ClearDirtyPlatesVisuals();
 
         // КАРТЫ: страховка — на чистом столе не должно оставаться доп. блюд

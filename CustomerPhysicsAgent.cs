@@ -36,6 +36,17 @@ using UnityEngine.AI;
 /// ТЕЛЕПОРТЫ: все перемещения «рывком» (спавн вне NavMesh, аварийная
 /// посадка) в CustomerAI идут через WarpTo() — при updatePosition=false
 /// без Warp агент повёл бы гостя со старого места.
+///
+/// ★ АНТИ-ЗАЛИПАНИЕ (обход толкучки): RVO-руление и физика разводят гостей
+/// не идеально — во встречных потоках и узких местах два гостя могут ДОЛГО
+/// толкаться друг с другом без прогресса. Если контакт с другим гостем
+/// держится дольше guestJamSeconds при живом курсе (путь есть, до цели
+/// не дошёл) и без горизонтального хода — включается манёвр обхода: на
+/// sidestepSeconds желаемая скорость тела ведётся дугой (sidestepAngle)
+/// в сторону ОТ мешающего гостя, и гость физически огибает его. Контакт
+/// ушёл и ход набрался — манёвр гасится досрочно, гость возвращается на
+/// курс. Встречные пары расходятся симметрично (оба берут «влево»),
+/// явная сторона дуги — по позиции конкретного блокера.
 /// </summary>
 [RequireComponent(typeof(NavMeshAgent))]
 [RequireComponent(typeof(CapsuleCollider))]
@@ -64,6 +75,20 @@ public class CustomerPhysicsAgent : MonoBehaviour
     [SerializeField] private float navMeshRecoveryInterval = 0.5f;
     [Tooltip("Радиус поиска ближайшей точки NavMesh при возврате (м)")]
     [SerializeField] private float navMeshRecoveryRadius = 2.5f;
+
+    [Header("Обход толкучки (анти-залипание гостей)")]
+    [Tooltip("Сколько секунд гость может толкаться с другим гостем без прогресса, " +
+             "прежде чем включится манёвр обхода (сек)")]
+    [SerializeField] private float guestJamSeconds = 1.5f;
+    [Tooltip("Длительность манёвра: столько времени скорость ведётся дугой вокруг " +
+             "мешающего гостя (сек)")]
+    [SerializeField] private float sidestepSeconds = 1f;
+    [Tooltip("Угол дуги манёвра (градусы). 75 — заметный заход сбоку, 90 — почти боком")]
+    [SerializeField, Range(15f, 120f)] private float sidestepAngle = 75f;
+    [Tooltip("Пауза перед повторным манёвром, если толкучка не разрешилась (сек)")]
+    [SerializeField] private float sidestepRepeatPause = 0.6f;
+    [Tooltip("Сдвиг за физ-кадр (м), ниже которого гость считается не движущимся")]
+    [SerializeField] private float sidestepProgressThreshold = 0.004f;
 
     [Header("Толкание игрока (перенесено из CustomerCollision)")]
     [Tooltip("Доля разводящего сдвига, которая уходит ИГРОКУ (0..1). Остаток гость " +
@@ -97,6 +122,20 @@ public class CustomerPhysicsAgent : MonoBehaviour
     // Сколько времени тело гостя находится вне NavMesh подряд.
     private float offMeshTimer;
 
+    // ★ Анти-залипание: контакт с другим гостем из скана ApplyPlayerPush
+    // (перечитывается каждый физ-кадр) и состояние манёвра обхода.
+    private bool hadGuestContact;
+    private Vector3 lastGuestContactPosition;
+    private float guestContactDistance;
+    private float guestJamTimer;
+    private float sidestepTimer;
+    private float sidestepCooldownTimer;
+    private float sidestepSide;
+    private Vector3 sidestepBaseDirection;
+    private float sidestepSpeed;
+    private Vector3 lastBodyPosition;
+    private bool lastBodyPositionValid;
+
     // Переиспользуемые буферы — ноль аллокаций в физ-кадре.
     private static readonly Collider[] overlapBuffer = new Collider[32];
     private static readonly RaycastHit[] castBuffer = new RaycastHit[8];
@@ -129,6 +168,13 @@ public class CustomerPhysicsAgent : MonoBehaviour
         {
             agent.obstacleAvoidanceType = ObstacleAvoidanceType.MedQualityObstacleAvoidance;
         }
+
+        // ★ Радиус «настоящего касания» двух гостей: сумма агентовых радиусов
+        // с запасом, но не меньше 0.6 м — капсулы префабов бывают шире
+        // agent.radius, и RVO тогда недооценивает зазор (типичная причина толкучки).
+        guestContactDistance = Mathf.Max(
+            (agent != null ? agent.radius : 0.35f) * 2f + 0.1f,
+            0.6f);
 
         if (debugLogs)
         {
@@ -249,6 +295,18 @@ public class CustomerPhysicsAgent : MonoBehaviour
                            agent.isOnNavMesh &&
                            !body.isKinematic;
 
+        // === Скан контактов: игрок (оттеснение) и другие гости (анти-залипание) ===
+        // Выполняется ДО расчёта скорости: пометка контакта с гостем нужна
+        // манёвру обхода в этом же физ-кадре.
+        if (agentDrives && IsGuestActiveState() && IsInteractionWindow())
+        {
+            ApplyPlayerPush();
+        }
+        else
+        {
+            hadGuestContact = false;
+        }
+
         // === Скорость: плавно тянем тело к желаемой скорости агента ===
         // Экспоненциальный Lerp — поведение не зависит от частоты физики.
         // Внешние толчки (игрок, дверь, другие гости) не затираются мгновенно:
@@ -260,6 +318,17 @@ public class CustomerPhysicsAgent : MonoBehaviour
         {
             Vector3 desired = agent.desiredVelocity;
             target = new Vector3(desired.x, current.y, desired.z);
+
+            // ★ Манёвр обхода: пока он активен, скорость тела ведётся по дуге
+            // вокруг мешающего гостя (в сторону от него) — даже если RVO-руление
+            // в затыке заглушило desiredVelocity: гость физически огибает препятствие.
+            if (sidestepTimer > 0f && sidestepBaseDirection.sqrMagnitude > 0.001f)
+            {
+                Vector3 arced = Quaternion.Euler(0f, sidestepAngle * sidestepSide, 0f) *
+                                (sidestepBaseDirection * sidestepSpeed);
+
+                target = new Vector3(arced.x, current.y, arced.z);
+            }
         }
         else
         {
@@ -276,6 +345,9 @@ public class CustomerPhysicsAgent : MonoBehaviour
         {
             agent.nextPosition = body.position;
         }
+
+        // === Анти-залипание: длительная толкучка с гостем → манёвр обхода ===
+        UpdateSidestepManeuver(agentDrives);
 
         // === Страховка NavMesh: вытолкнутого с сетки гостя возвращаем назад ===
         // Толчок игрока/двери может занести тело в carve-дыру стола или двери,
@@ -313,12 +385,6 @@ public class CustomerPhysicsAgent : MonoBehaviour
         {
             offMeshTimer = 0f;
         }
-
-        // === Гость оттесняет игрока (CustomerCollision + фикс знаков) ===
-        if (agentDrives && IsGuestActiveState() && IsInteractionWindow())
-        {
-            ApplyPlayerPush();
-        }
     }
 
     /// <summary>
@@ -349,11 +415,15 @@ public class CustomerPhysicsAgent : MonoBehaviour
     }
 
     /// <summary>
-    /// Один OverlapSphere на физ-кадр. Гостя-гостя больше не разводим вручную —
-    /// их разводит PhysX. Здесь остаётся только контакт с игроком.
+    /// Один OverlapSphere на физ-кадр. Гостя-гостя по-прежнему разводит PhysX;
+    /// здесь остаётся оттеснение игрока — и, с анти-залипанием, ЗАМЕТКА
+    /// контакта с другим гостем для манёвра обхода (hadGuestContact).
     /// </summary>
     private void ApplyPlayerPush()
     {
+        hadGuestContact = false;
+        lastGuestContactPosition = Vector3.zero;
+
         float scanRadius = GetPlayerScanRadius();
 
         // Сфера на высоте груди: ловит капсулу игрока (0..2 м), но не пол.
@@ -389,8 +459,154 @@ public class CustomerPhysicsAgent : MonoBehaviour
                 ResolvePlayerContact(player, col);
             }
 
-            // Всё прочее (стены, мебель, другие гости) — зона ответственности
-            // NavMesh-руления и PhysX.
+            // ★ Анти-залипание: заодно фиксируем контакт с ДРУГИМ гостем —
+            // в радиусе настоящего касания, а не всего скан-радиуса сферы.
+            CustomerAI otherGuest = col.GetComponentInParent<CustomerAI>();
+
+            if (otherGuest != null && otherGuest != self)
+            {
+                Vector3 toGuest = otherGuest.transform.position - transform.position;
+                toGuest.y = 0f;
+
+                if (toGuest.magnitude <= guestContactDistance)
+                {
+                    hadGuestContact = true;
+
+                    if (lastGuestContactPosition.sqrMagnitude < 0.0001f)
+                    {
+                        lastGuestContactPosition = otherGuest.transform.position;
+                    }
+                }
+            }
+
+            // Всё прочее (стены, мебель) — зона ответственности NavMesh-руления и PhysX.
+        }
+    }
+
+    /// <summary>
+    /// ★ Анти-залипание: накопление «толкучки» и запуск/гашение манёвра обхода.
+    /// Толкучка = контакт с другим гостем при живом курсе (путь есть, до цели
+    /// не дошёл) и без горизонтального прогресса. Манёвр: на sidestepSeconds
+    /// желаемая скорость идёт дугой от мешающего гостя; контакт ушёл и ход
+    /// набрался — гасим досрочно, гость возвращается на курс.
+    /// </summary>
+    private void UpdateSidestepManeuver(bool agentDrives)
+    {
+        bool active = agentDrives && IsGuestActiveState() && IsInteractionWindow();
+
+        if (!active)
+        {
+            guestJamTimer = 0f;
+            sidestepTimer = 0f;
+            lastBodyPosition = body != null ? body.position : transform.position;
+            lastBodyPositionValid = body != null;
+            return;
+        }
+
+        // Хочет ли гость идти: путь есть и до цели ещё не дошёл. Стоящий в
+        // очереди и севший гость желания не выражают — толкучка «на месте»
+        // манёвр не запускает.
+        bool tryingToGo = agent.hasPath &&
+                          agent.remainingDistance > agent.stoppingDistance + 0.1f;
+
+        // Горизонтальный прогресс за физ-кадр.
+        Vector3 frameDelta = body.position - lastBodyPosition;
+        frameDelta.y = 0f;
+        bool progressed = lastBodyPositionValid &&
+                          frameDelta.magnitude > sidestepProgressThreshold;
+
+        if (hadGuestContact && tryingToGo && !progressed)
+        {
+            // Толкается с гостем, курс жив, а места не набирает — копим таймер.
+            guestJamTimer += Time.fixedDeltaTime;
+        }
+        else
+        {
+            // Контакт или затык разрешились — таймер гаснет вдвое быстрее накопления.
+            guestJamTimer = Mathf.Max(0f, guestJamTimer - Time.fixedDeltaTime * 2f);
+        }
+
+        if (sidestepCooldownTimer > 0f)
+        {
+            sidestepCooldownTimer -= Time.fixedDeltaTime;
+        }
+
+        if (sidestepTimer > 0f)
+        {
+            sidestepTimer -= Time.fixedDeltaTime;
+
+            // Досрочный выход: контакт ушёл и гость снова набирает ход.
+            if (!hadGuestContact && progressed)
+            {
+                sidestepTimer = 0f;
+            }
+        }
+        else if (tryingToGo &&
+                 guestJamTimer >= guestJamSeconds &&
+                 sidestepCooldownTimer <= 0f)
+        {
+            StartSidestep();
+        }
+
+        lastBodyPosition = body.position;
+        lastBodyPositionValid = true;
+    }
+
+    /// <summary>
+    /// ★ Запуск манёвра обхода: фиксируем курс на момент старта (желаемая
+    /// скорость, иначе конечная точка пути, иначе взгляд), скорость и сторону
+    /// дуги — от мешающего гостя. Встречные пары при неопределённой стороне
+    /// расходятся симметрично: оба берут «влево» и разъезжаются.
+    /// </summary>
+    private void StartSidestep()
+    {
+        sidestepTimer = sidestepSeconds;
+        sidestepCooldownTimer = sidestepSeconds + sidestepRepeatPause;
+        guestJamTimer = 0f;
+
+        Vector3 course = agent != null ? agent.desiredVelocity : Vector3.zero;
+        course.y = 0f;
+
+        if (course.sqrMagnitude < 0.0001f && agent != null && agent.hasPath &&
+            agent.path != null && agent.path.corners.Length >= 2)
+        {
+            course = agent.path.corners[agent.path.corners.Length - 1] - transform.position;
+            course.y = 0f;
+        }
+
+        if (course.sqrMagnitude < 0.0001f)
+        {
+            course = transform.forward;
+            course.y = 0f;
+        }
+
+        sidestepBaseDirection = course.normalized;
+        sidestepSpeed = agent != null && agent.speed > 0.05f ? agent.speed : 1.5f;
+
+        Vector3 toBlocker = lastGuestContactPosition - transform.position;
+        toBlocker.y = 0f;
+
+        if (toBlocker.sqrMagnitude < 0.0001f)
+        {
+            // Блокер не опознан (контакт по буферу скана) — дуга «влево»:
+            // встречный гость с тем же правилом возьмёт СВОЁ «влево» —
+            // разъедутся в противоположные стороны мира.
+            sidestepSide = -1f;
+        }
+        else
+        {
+            // Блокер левее курса (cross > 0) — дуга вправо (+1), и наоборот.
+            float cross = sidestepBaseDirection.x * toBlocker.z -
+                          sidestepBaseDirection.z * toBlocker.x;
+
+            sidestepSide = cross > 0f ? 1f : -1f;
+        }
+
+        if (debugLogs)
+        {
+            Debug.Log($"[CustomerPhysicsAgent] '{name}': долго толкается с другим гостем — " +
+                      $"обход дугой {(sidestepSide > 0f ? "вправо" : "влево")} " +
+                      $"({sidestepAngle}°, {sidestepSeconds} с).", this);
         }
     }
 

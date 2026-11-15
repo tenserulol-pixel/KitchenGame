@@ -18,6 +18,26 @@ public class CustomerAI : MonoBehaviour, IHasProgress
         Queueing        // Стоит в очереди, ждёт освободившийся стол — терпение тикает отдельно
     }
 
+    // === ТИПЫ КЛИЕНТОВ (особенности) ===
+    // Тип назначается CustomerManager'ом при спавне всей группы — группа всегда
+    // однородная (гоблины, кобольды или призрак по отдельности).
+    //
+    // Goblin — базовый клиент без особенностей: сел → один заказ → ел → ушёл.
+    // Kobold — приходит ТОЛЬКО группой (2+ человека — обеспечивает CustomerManager
+    //          через GetGroupSizeForType), и вся группа заказывает ОДНО И ТО ЖЕ
+    //          блюдо (зеркалирование в DiningTable.CustomerSeated — тот же механизм,
+    //          что и у карты «Общий заказ», но без вероятности: всегда).
+    // Ghost  — приходит один и делает НЕСКОЛЬКО заказов ПОДРЯД (ghostConsecutiveOrders,
+    //          по умолчанию 3): сел → заказ №1 → игрок подал → СРАЗУ заказ №2 →
+    //          подал → заказ №3 → призрак уходит. Между заказами не ест и по
+    //          завершении не оставляет грязной посуды.
+    public enum CustomerType
+    {
+        Goblin,
+        Kobold,
+        Ghost
+    }
+
     public event EventHandler OnStateChanged;
 
     // === IHasProgress: прогресс-бар терпения ===
@@ -41,6 +61,19 @@ public class CustomerAI : MonoBehaviour, IHasProgress
     [Header("Заказы")]
     [SerializeField] private RecipeListSO recipeListSO;
     [SerializeField] private Transform orderVisualPrefab;
+
+    [Header("Особенности типов")]
+    [Tooltip("Сколько заказов ПОДРЯД делает призрак за одно посещение (минимум 1).\nГоблин и кобольд всегда делают 1 заказ за визит.")]
+    [SerializeField] private int ghostConsecutiveOrders = 3;
+
+    // Тип этого клиента. По умолчанию гоблин (базовый) — тогда даже если спавнер
+    // забыл назначить тип (старый код, ручной спавн), поведение не меняется.
+    private CustomerType customerType = CustomerType.Goblin;
+
+    // Сколько заказов осталось сделать за ЭТО посещение (включая текущий незакрытый).
+    // Инициализируется в SitDown по типу: гоблин/кобольд — 1, призрак — ghostConsecutiveOrders.
+    // Уменьшается в DeliverOrder; призрак при ordersRemaining > 0 сразу делает следующий заказ.
+    private int ordersRemaining = 1;
 
     [Header("Достижимость места (анти-«посадка за стеной»)")]
     [Tooltip("Расстояние по пути, при котором гость считается пришедшим к стулу")]
@@ -121,6 +154,22 @@ public class CustomerAI : MonoBehaviour, IHasProgress
     {
         SetState(CustomerState.Walking);
     }
+
+    // ======================================================================
+    // === ТИП КЛИЕНТА ===
+    // ======================================================================
+
+    /// <summary>Назначает тип клиента. Вызывается CustomerManager'ом сразу после Instantiate,
+    /// до первого кадра Update — все особенности (групповые заказы, серия призрака)
+    /// подхватываются с самого начала жизненного цикла.</summary>
+    public void SetCustomerType(CustomerType type)
+    {
+        customerType = type;
+    }
+
+    /// <summary>Тип этого клиента (гоблин / кобольд / призрак). Читается DiningTable
+    /// при посадке (зеркалирование кобольдов) и самим CustomerAI в цикле заказов.</summary>
+    public CustomerType GetCustomerType() => customerType;
 
     private void Update()
     {
@@ -642,6 +691,12 @@ public class CustomerAI : MonoBehaviour, IHasProgress
         // КАРТА «Спешащие гости»: садимся с ЭФФЕКТИВНЫМ терпением (maxPatience * множитель)
         patienceTimer = maxPatience * GetEffectivePatienceMultiplier();
 
+        // ТИП: призрак делает несколько заказов подряд (ghostConsecutiveOrders),
+        // остальные типы — один заказ за визит. Счётчик расходуется в DeliverOrder.
+        ordersRemaining = customerType == CustomerType.Ghost
+            ? Mathf.Max(1, ghostConsecutiveOrders)
+            : 1;
+
         diningTable.CustomerSeated(this);
 
         ShowOrder();
@@ -694,6 +749,9 @@ public class CustomerAI : MonoBehaviour, IHasProgress
 
     private void DeliverOrder()
     {
+        // Один заказ «закрыт»: убираем его из счётчика и стираем ссылку —
+        // и для призрака, и для обычных гостей (защита от повторной подачи того же рецепта).
+        ordersRemaining = Mathf.Max(0, ordersRemaining - 1);
         orderedRecipe = null;
 
         if (orderVisualInstance != null)
@@ -701,6 +759,33 @@ public class CustomerAI : MonoBehaviour, IHasProgress
             Destroy(orderVisualInstance);
         }
 
+        // === ПРИЗРАК: серия заказов подряд ===
+        // Спецификация: пришёл → игрок взял заказ → отдал → СРАЗУ берёт следующий
+        // заказ у этого же призрака. Призрак не ест между заказами и не оставляет
+        // грязной посуды: после последнего заказа просто встаёт и уходит.
+        //
+        // ВАЖНО (reentrancy): LeaveTable вызывается из цепочки TryServe → TryDeliver
+        // → DeliverOrder, то есть пока DiningTable перебирает currentCustomers и
+        // DeliveryManager ещё не удалил заказ из waitingOrderList. Это безопасно:
+        // 1) TryServe итерирует по СНИМКУ списка (см. DiningTable.TryServe);
+        // 2) orderedRecipe уже null, поэтому LeaveTable НЕ трогает waitingOrderList —
+        //    текущий заказ удалит сам DeliveryManager сразу после выхода из TryServe.
+        if (customerType == CustomerType.Ghost)
+        {
+            if (ordersRemaining > 0)
+            {
+                StartNextGhostOrder();
+            }
+            else
+            {
+                Debug.Log($"[CustomerAI] Призрак '{name}' получил все заказы — уходит (без грязной посуды).");
+                LeaveTable();
+            }
+            return;
+        }
+
+        // Гоблин / кобольд: обычный цикл — анимация еды, таймер, потом уход через
+        // FinishedEating (см. UpdateEating и DiningTable.OnCustomerFinishedEating).
         if (animator != null)
         {
             animator.SetTrigger("Eat");
@@ -708,6 +793,47 @@ public class CustomerAI : MonoBehaviour, IHasProgress
 
         eatingTimer = eatingTime;
         SetState(CustomerState.Eating);
+    }
+
+    /// <summary>
+    /// ПРИЗРАК: следующий заказ в серии. Полный аналог блока заказов из SitDown
+    /// (выбор рецепта → пузырь над головой → регистрация в DeliveryManager), но
+    /// без пересадки: призрак уже сидит на своём стуле.
+    /// Терпение обновляется на полный — каждый заказ серии получает собственный
+    /// таймер ожидания, и прогресс-бар над призраком снова показывается полным.
+    /// </summary>
+    private void StartNextGhostOrder()
+    {
+        SelectRecipe();
+
+        if (orderedRecipe == null)
+        {
+            // Пустой recipeListSO — серию продолжить нельзя, призрак уходит как после последнего заказа.
+            Debug.LogWarning($"[CustomerAI] Призрак '{name}': не смог выбрать следующий заказ (проверь recipeListSO) — уходит.");
+            LeaveTable();
+            return;
+        }
+
+        // Свежее терпение под новый заказ серии.
+        patienceTimer = maxPatience * GetEffectivePatienceMultiplier();
+
+        ShowOrder();
+
+        if (DeliveryManager.Instance != null)
+        {
+            DeliveryManager.Instance.AddOrderFromTable(orderedRecipe, diningTable);
+        }
+
+        // Состояние уже WaitingForFood — SetState перестреляет OnStateChanged,
+        // но бар НЕ скрывает (скрытие только для прочих состояний). Показываем полный.
+        SetState(CustomerState.WaitingForFood);
+        OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs
+        {
+            progressNormalized = 1f
+        });
+
+        Debug.Log($"[CustomerAI] Призрак '{name}' делает следующий заказ: «{orderedRecipe.RecipeName}» " +
+                  $"(осталось в серии: {ordersRemaining - 1}).");
     }
 
     private void ShowOrder()

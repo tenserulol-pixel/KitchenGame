@@ -17,6 +17,10 @@ using UnityEngine;
 ///
 /// Сам ShopUI НЕ блокирует движение игрока — это делает ShopManager через
 /// GameInput.DisablePlayerInput(). Здесь только визуальная часть.
+///
+/// ★ v1.1 (стены вне витрины): товары, чей префаб содержит WallPiece (стены),
+/// не показываются в магазине — покупка стен запрещена (ShopManager v1.6),
+/// расстановка стен — только в редакторе Unity (GridSnapEditor).
 /// </summary>
 public class ShopUI : MonoBehaviour
 {
@@ -170,6 +174,12 @@ public class ShopUI : MonoBehaviour
 
         List<ShopItemSO> items = ShopManager.Instance.GetCatalogItems();
         if (items == null) return;
+
+        // ★ v1.1: стены не продаются игроку — не показываем их карточки в витрине.
+        // ВАЖНО: из каталога SO стены НЕ удаляем — FurnitureSaveUtility ищет
+        // itemId редакторских стен по каталогу (FindItemIdForCounter).
+        items.RemoveAll(it => it != null && it.prefab != null
+                              && it.prefab.GetComponentInChildren<WallPiece>(true) != null);
 
         foreach (ShopItemSO item in items)
         {

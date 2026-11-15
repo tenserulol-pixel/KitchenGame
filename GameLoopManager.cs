@@ -311,6 +311,11 @@ public class GameLoopManager : MonoBehaviour
     {
         state = State.DayResults;
 
+        // ★ Конец дня: посуда не переживает смену — столы очищаются от грязных
+        // стопок, стопки чистой посуды пополняются до максимума, грязные тарелки
+        // «в мире» (руки игрока, раковина, прилавки) исчезают.
+        ResetDishesForNewDay();
+
         // Добавляем чистую дневную прибыль в общий кошелек игрока
         int netProfit = goldEarnedToday - goldLostToday;
         totalGold = Mathf.Max(0, totalGold + netProfit);
@@ -335,6 +340,61 @@ public class GameLoopManager : MonoBehaviour
                   $"Успешно: {successfulDeliveriesToday} (Заработано: {goldEarnedToday}g), " +
                   $"Провалено: {failedDeliveriesToday} (Штрафы: {goldLostToday}g). " +
                   $"Текущий общий баланс: {totalGold}g.");
+    }
+
+    /// <summary>
+    /// ★ Конец дня: полный сброс посуды. День заканчивается только при пустом
+    /// зале (IsDailyWorkloadComplete), поэтому сидящих гостей к этому моменту нет —
+    /// столы можно освобождать без каскадов ухода.
+    ///
+    /// 1) СТОЛЫ: CleanTable() у каждого стола из реестра CustomerManager — грязные
+    ///    стопки исчезают, счётчики группы и plateless-пометки обнуляются, стол
+    ///    возвращается в Free. В подготовке нового дня игрок не обязан мыть посуду
+    ///    за вчерашнюю смену.
+    /// 2) PLATECOUNTER-Ы: RefillForNewDay() — стопка чистой посуды пополняется
+    ///    до максимума (с учётом купленного апгрейда «Самонаполняющаяся стопка»).
+    /// 3) РАКОВИНЫ: ResetForNewDay() — грязная тарелка на мойке исчезает,
+    ///    прогресс мойки сбрасывается.
+    /// 4) БРОДЯЧАЯ ПОСУДА: все прочие грязные тарелки в мире (в руках игрока,
+    ///    на прилавках) уничтожаются — отличить их позволяет статический реестр
+    ///    SinkCounter.IsDirtyPlateSO. Чистые тарелки НЕ трогаем: это обычные предметы.
+    /// </summary>
+    private void ResetDishesForNewDay()
+    {
+        // 1) Столы — через реестр CustomerManager (купленные в лавке тоже там)
+        if (CustomerManager.Instance != null)
+        {
+            foreach (DiningTable table in CustomerManager.Instance.GetAllTables())
+            {
+                if (table != null)
+                {
+                    table.CleanTable();
+                }
+            }
+        }
+
+        // 2) Стопки чистой посуды
+        foreach (PlatesCounter platesCounter in FindObjectsOfType<PlatesCounter>())
+        {
+            platesCounter.RefillForNewDay();
+        }
+
+        // 3) Раковины: грязная тарелка исчезает, мойка сбрасывается
+        foreach (SinkCounter sinkCounter in FindObjectsOfType<SinkCounter>())
+        {
+            sinkCounter.ResetForNewDay();
+        }
+
+        // 4) Грязные тарелки где угодно ещё (руки игрока, ClearCounter, и т.д.)
+        foreach (KitchenObject kitchenObject in FindObjectsOfType<KitchenObject>())
+        {
+            if (kitchenObject != null && SinkCounter.IsDirtyPlateSO(kitchenObject.GetKitchenObjectSo()))
+            {
+                kitchenObject.DestroySelf();
+            }
+        }
+
+        Debug.Log("[GameLoop] Смена закончилась: посуда убрана — столы чистые, стопки тарелок пополнены.");
     }
 
     /// <summary>

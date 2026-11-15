@@ -83,6 +83,63 @@ using System.Collections.Generic;
 /// - Конфликт «две стены на одном ребре» ловит рёберный реестр сетки;
 ///   лёгкое касание стен друг другом при стыковке физикой НЕ блокируется.
 /// - Постановка купленной стены из лавки идёт по тому же рёберному пути.
+///
+/// ★ v2.5 (запрет переноса стен игроком):
+/// - Попытка поднять стену по T (TryStartMoving) блокируется: стены ставятся
+///   только в редакторе сцены (GridSnapEditor).
+/// - Вся стеновая механика призрака (рёбра, магнит, R-ориентация) сохранена —
+///   она не активна в рантайме (стены игрок не двигает), но код остаётся
+///   для совместимости (isMovingWall, TrySnapWorldToWallEdge).
+///
+/// ★ v2.6 (стены полностью вне рук игрока):
+/// - BeginPlacingPurchasedItem ОТКАЗЫВАЕТ стеновым товарам: покупка и постановка
+///   стен игроком запрещены на уровне ShopManager.TryBuyItem (v1.6) и скрыты
+///   из витрины (ShopUI), а это вторая линия обороны — если стеновой предмет
+///   каким-то путём дошёл до призрачной постановки, она не начнётся, инстанс
+///   уничтожит вызывающий код, золото не спишется (CompletePendingPurchase не звался).
+/// - Стены живут только в редакторе Unity: расстановка — GridSnapEditor,
+///   в игре они часть декораций.
+///
+/// ★ v2.7 (текст лога + стены без BaseCounter):
+/// - Лог у T-гейта больше не упоминает лавку («расстановка стен — в редакторе
+///   ИЛИ ЧЕРЕЗ ЛАВКУ» — устарело: с ShopManager v1.6 лавка стены не продаёт).
+/// - WallPiece.IsWall теперь принимает Component (WallPiece v1.1) — гейты
+///   работают и для стен, с которых сняли BaseCounter (у таких стен игрок
+///   и так не может её выделить — луч ищет только BaseCounter).
+///
+/// ★ v2.8 (единые правила у стены: генератор ↔ ручной перенос):
+/// - РАСХОЖДЕНИЕ: BSP-генератор ставит станции у стен чисто по клеткам (без
+///   физики), а ручной перенос проверяет место физическим OverlapBox с
+///   зазором wallClearance (0.05 м). Стены стоят НА рёбрах сетки и торчат
+///   внутрь клетки на полтолщины (толщина 0.2 м → клин 0.1 м): у «стандартной»
+///   станции (footprint ~ клетка) бокс всегда задевал этот клин — и клетки
+///   у стен, куда генератор спокойно ставит станции, для ручного переноса
+///   были всегда «в стене».
+/// - ФИКС: если место заблокировала стена с маркером WallPiece, проверочный
+///   бокс дополнительно сжимается на полтолщины ЭТОЙ стены + 2 см — клин
+///   прощается (второй проход TryScanWallBlock). Реальное пересечение тела
+///   стены (мебель шире клетки, перпендикулярная стена, стена лицом) и любой
+///   декор без WallPiece блокируются по-прежнему.
+///
+/// ★ v2.9 (запрет постановки «СКВОЗЬ СТЕНУ»):
+/// - ДЫРА: проверялось только МЕСТО постановки (OverlapBox у призрака), но не
+///   ПУТЬ от игрока к этому месту. Ячейка за стеной сама по себе свободна и
+///   ничего не пересекает — поэтому предмет можно было «продавить» сквозь
+///   стену: маленькие предметы (бокс не доставал до клина стены) — всегда,
+///   полноразмерные станции — с v2.8, когда клин WallPiece стал прощаться.
+///   Отсюда симптом «сквозь НЕКОТОРЫЕ стены поставить можно»: зависело от
+///   геометрии предмета и того, прощается ли клин конкретной стены.
+/// - ФИКС: IsPlacementBlocked теперь проверяет и ПУТЬ: луч от игрока к
+///   месту постановки на высоте 1 м. Перекрывать путь может то же, что и
+///   место (стены, рамы, статичный декор); мебель, стулья, игрок, клиенты,
+///   предметы на станциях, пол и динамические тела (открытая створка двери)
+///   путь не перекрывают. Запертая створка кинематична — перекрывает, ровно
+///   как и в проверке места. Ручной режим wallMask: путь перекрывают только
+///   коллайдеры выбранных слоёв.
+/// - v2.8 НЕ откатывает: место у стены, до которого можно дотянуться по
+///   прямой БЕЗ пересечения стены, ставится как раньше. Если цель за стеной —
+///   призрак остаётся на последнем корректном месте и красится, а лог говорит
+///   «сквозь стену ставить нельзя»; обойди стену и подтверждай с той стороны.
 /// </summary>
 public class FurnitureMovingController : MonoBehaviour
 {
@@ -170,6 +227,20 @@ public class FurnitureMovingController : MonoBehaviour
 
     // ★ v2.2: последний коллайдер ЧУЖОЙ мебели, найденный проверкой наложения, — для лога причины.
     private Collider lastFurnitureHit;
+
+    // ★ v2.9: последний коллайдер, перекрывший ПУТЬ от игрока к месту
+    // постановки (луч пути), — для лога причины «сквозь стену». Чистится
+    // в IsPlacementBlocked, как и остальные причины.
+    private Collider lastPathWallHit;
+
+    // ★ v2.9: высота луча проверки пути над полом (м). Стены — вертикальные
+    // коллайдеры высотой ~2.5 м, игрок в этой игре живёт от пола — луч на 1 м
+    // ловит именно стены/рамы и не цепляет ни пол, ни верхние перекладины проёмов.
+    private const float PathCheckHeight = 1.0f;
+
+    // ★ v2.9: переиспользуемый буфер для RaycastNonAlloc (луч «игрок → место»;
+    // у Physics.Linecast нет NonAlloc-перегрузки) — ноль аллокаций в кадр.
+    private static readonly RaycastHit[] pathHitBuffer = new RaycastHit[16];
 
     // ★ v2.1: ссылка на стол с NavMeshObstacle, поднятый прямо сейчас, — чтобы
     // гарантированно вернуть obstacle при подтверждении И при отмене.
@@ -424,6 +495,18 @@ public class FurnitureMovingController : MonoBehaviour
             return false;
         }
 
+        // ★ v2.6: стены игрок не покупает и не ставит — расстановка только в
+        // редакторе Unity (GridSnapEditor). Страховка поверх гейта в
+        // ShopManager.TryBuyItem: если стеновой товар каким-то путём дошёл до
+        // призрачной постановки — отказываем, вызывающий код (TryBeginGhostPurchase)
+        // уничтожит инстанс; золото не тронуто (CompletePendingPurchase не звался).
+        if (WallPiece.IsWall(instance))
+        {
+            Debug.LogWarning($"[FurnitureMoving] '{instance.name}' — стены не ставятся игроком " +
+                             "(расстановка стен — только в редакторе Unity).");
+            return false;
+        }
+
         if (IsMoving)
         {
             Debug.LogWarning("[FurnitureMoving] Нельзя начать постановку покупки — " +
@@ -473,6 +556,7 @@ public class FurnitureMovingController : MonoBehaviour
         hasBlockedCell = false;
         lastWallHit = null;
         lastFurnitureHit = null;
+        lastPathWallHit = null;
 
         PlaySoundAt(pickupSound, instance.transform.position);
 
@@ -503,10 +587,25 @@ public class FurnitureMovingController : MonoBehaviour
             return;
         }
 
+        // ★ v2.5/v2.7: стены игрок не переносит — их расстановка происходит только
+        // в редакторе Unity (GridSnapEditor). Подъём по T у стены отклоняется.
+        if (WallPiece.IsWall(selectedCounter))
+        {
+            if (logBlockedReasons)
+            {
+                Debug.Log($"[FurnitureMoving] '{selectedCounter.name}' — стену переносить нельзя " +
+                          "(расстановка стен — только в редакторе Unity).");
+            }
+
+            return;
+        }
+
         movingCounter = selectedCounter;
         originalWorldPosition = selectedCounter.transform.position;
 
         // ★ v2.4: стены — особый режим призрака (рёбра сетки вместо ячеек).
+        // ★ v2.5: сюда стены больше не доходят (блок выше), но флаг оставлен —
+        // BeginPlacingPurchasedItem включает его для купленных стен.
         isMovingWall = WallPiece.IsWall(selectedCounter);
         wallOrientationOverride = 0;
         hasSnappedEdge = false;
@@ -546,6 +645,7 @@ public class FurnitureMovingController : MonoBehaviour
         hasBlockedCell = false;
         lastWallHit = null;
         lastFurnitureHit = null;
+        lastPathWallHit = null;
 
         PlaySoundAt(pickupSound, selectedCounter.transform.position);
 
@@ -967,13 +1067,25 @@ public class FurnitureMovingController : MonoBehaviour
 
         hasBlockedCell = true;
 
-        // ★ v2.2: два рода причин — чужая мебель и стена. Формулировка зависит
-        // от того, что именно нашлось (оба поля чистятся в IsPlacementBlocked,
-        // поэтому «протухших» значений с прошлого кадра здесь не бывает).
+        // ★ v2.2/v2.9: три рода причин — чужая мебель, стена НА МЕСТЕ и
+        // стена НА ПУТИ. Формулировка зависит от того, что именно нашлось
+        // (все поля чистятся в IsPlacementBlocked, поэтому «протухших»
+        // значений с прошлого кадра здесь не бывает).
         if (lastFurnitureHit != null)
         {
             Debug.Log($"[FurnitureMoving] Место занято мебелью: '{lastFurnitureHit.gameObject.name}' " +
                       $"(объект '{lastFurnitureHit.transform.root.name}') — призрак ждёт свободную ячейку.");
+            return;
+        }
+
+        // ★ v2.9: путь от игрока перекрыт стеной — отдельная формулировка,
+        // чтобы «сквозь стену» не путался с «место в стене».
+        if (lastPathWallHit != null)
+        {
+            Debug.Log($"[FurnitureMoving] Сквозь стену ставить нельзя: путь от игрока к месту " +
+                      $"пересекает '{lastPathWallHit.gameObject.name}' " +
+                      $"(объект '{lastPathWallHit.transform.root.name}'). " +
+                      "Обойди препятствие и подтверждай с той стороны, где место видно.");
             return;
         }
 
@@ -1089,9 +1201,12 @@ public class FurnitureMovingController : MonoBehaviour
     /// самопересечения нет. wallClearance сжимает бокс: касание стены
     /// вплотную не блокирует постановку.
     ///
-    /// wallMask != 0 — ручной режим: стенами считаются только выбранные слои.
-    /// wallMask == 0 — АВТО-режим: опрашиваем все слои и отсеиваем всё,
-    /// что НЕ стена (мебель, стулья, игрок, клиенты, дверное полотно, пол).
+    /// ★ v2.8: сетевые стены (WallPiece) торчат внутрь клетки на полтолщины —
+    /// стандартная станция у стены всегда задевала этот клин, хотя генератор
+    /// ставит такие места без физики. Если блокировка пришла от WallPiece,
+    /// бокс дополнительно сжимается на полтолщины этой стены + 2 см — клин
+    /// прощается; реальное пересечение тела стены (мебель шире клетки,
+    /// перпендикулярная стена, декор без WallPiece) блокируется по-прежнему.
     /// </summary>
     private bool IsOverlappingWall(Vector3 testPosition)
     {
@@ -1102,10 +1217,41 @@ public class FurnitureMovingController : MonoBehaviour
             return false;
         }
 
+        if (!TryScanWallBlock(testPosition, wallClearance, out float wallAllowance))
+        {
+            return false;
+        }
+
+        // Блокировка есть. Если виновники — сетевые стены, прощаем их клин
+        // в клетку: повторный проход с увеличенным зазором. Пересечение
+        // осталось (стена толще, предмет шире клетки, чужой декор) —
+        // честное «в стену».
+        if (wallAllowance <= 0f)
+        {
+            return true;
+        }
+
+        return TryScanWallBlock(testPosition, wallClearance + wallAllowance, out _);
+    }
+
+    /// <summary>
+    /// ★ v2.8: один проход проверки стен с заданным зазором. Возвращает true,
+    /// если бокс (сжатый на clearance с каждой стороны) пересекает стену;
+    /// wallAllowance — максимальный «клин» среди стен-виновников
+    /// (WallPiece: полтолщины + 2 см; у прочих коллайдеров 0).
+    /// lastWallHit — первый найденный виновник (для диагностики).
+    /// wallMask != 0 — ручной режим: стенами считаются только выбранные слои.
+    /// wallMask == 0 — АВТО-режим: опрашиваем все слои и отсеиваем всё,
+    /// что НЕ стена (мебель, стулья, игрок, клиенты, дверное полотно, пол).
+    /// </summary>
+    private bool TryScanWallBlock(Vector3 testPosition, float clearance, out float wallAllowance)
+    {
+        wallAllowance = 0f;
+
         Vector3 half = wallBoxHalfExtents;
-        half.x = Mathf.Max(0.01f, half.x - wallClearance);
-        half.y = Mathf.Max(0.01f, half.y - wallClearance);
-        half.z = Mathf.Max(0.01f, half.z - wallClearance);
+        half.x = Mathf.Max(0.01f, half.x - clearance);
+        half.y = Mathf.Max(0.01f, half.y - clearance);
+        half.z = Mathf.Max(0.01f, half.z - clearance);
 
         // ★ v2.3: бокс вращается вместе с предметом — смещение центра и сама
         // ориентация бокса зависят от текущего поворота призрака.
@@ -1123,9 +1269,21 @@ public class FurnitureMovingController : MonoBehaviour
                 wallMask,
                 QueryTriggerInteraction.Ignore);
 
-            if (layerHits > 0 && wallOverlapBuffer[0] != null)
+            for (int i = 0; i < layerHits; i++)
             {
-                lastWallHit = wallOverlapBuffer[0];
+                Collider hit = wallOverlapBuffer[i];
+
+                if (hit == null)
+                {
+                    break;
+                }
+
+                if (lastWallHit == null)
+                {
+                    lastWallHit = hit;
+                }
+
+                wallAllowance = Mathf.Max(wallAllowance, WallIntrusionAllowance(hit));
             }
 
             return layerHits > 0;
@@ -1210,8 +1368,135 @@ public class FurnitureMovingController : MonoBehaviour
             }
 
             // Всё остальное (стены, дверная рама, колонны, статичный декор) —
-            // считается стеной: призрак туда не идёт.
-            lastWallHit = hit;
+            // считается стеной: призрак туда не идёт. Для сетевых стен
+            // (WallPiece) запоминаем их «клин» — полтолщины внутрь клетки.
+            if (lastWallHit == null)
+            {
+                lastWallHit = hit;
+            }
+
+            wallAllowance = Mathf.Max(wallAllowance, WallIntrusionAllowance(hit));
+        }
+
+        return lastWallHit != null;
+    }
+
+    /// <summary>
+    /// ★ v2.8: «клин» сетевой стены — насколько её тело торчит внутрь клетки
+    /// (полтолщины сегмента: стеновые префабы ставятся НА ребро, центр
+    /// геометрии на линии ребра) + 2 см зазора. Только для коллайдеров с
+    /// маркером WallPiece; геометрию снять не удалось — 0 (строгий режим).
+    /// </summary>
+    private static float WallIntrusionAllowance(Collider hit)
+    {
+        WallPiece wall = hit.GetComponentInParent<WallPiece>();
+
+        if (wall == null || !WallPiece.TryGetGeometryBounds(wall, out Bounds bounds))
+        {
+            return 0f;
+        }
+
+        return Mathf.Min(bounds.size.x, bounds.size.z) * 0.5f + 0.02f;
+    }
+
+    /// <summary>
+    /// ★ v2.9: перекрывает ли ПРЯМОЙ ПУТЬ от игрока к месту постановки стену.
+    /// Раньше проверялось только МЕСТО (OverlapBox у призрака): ячейка за
+    /// стеной сама по себе свободна и ничего не пересекает, поэтому предмет
+    /// можно было «продавить» сквозь стену — маленькие предметы всегда,
+    /// крупные станции с v2.8 (прощённый клин WallPiece).
+    ///
+    /// Классификация препятствий — та же, что в проверке места: стены, дверные
+    /// рамы, колонны и статичный декор перекрывают путь; мебель (BaseCounter),
+    /// стулья, игрок, клиенты, предметы на станциях, пол и динамические тела
+    /// (открытая створка двери, физический реквизит) — нет. Запертая створка
+    /// кинематична и перекрывает путь — ровно как и в проверке места.
+    ///
+    /// Ручной режим (wallMask != 0): путь перекрывают ТОЛЬКО коллайдеры
+    /// выбранных слоёв — согласовано с TryScanWallBlock.
+    /// </summary>
+    private bool IsPathCrossingWall(Vector3 targetPosition)
+    {
+        lastPathWallHit = null;
+
+        if (Player.Instance == null || !wallBoxValid || movingCounter == null)
+        {
+            return false;
+        }
+
+        Vector3 from = Player.Instance.transform.position + Vector3.up * PathCheckHeight;
+        Vector3 to = targetPosition + Vector3.up * PathCheckHeight;
+
+        // Игрок уже в точке постановки (или луч вырожден) — путь проверять нечем.
+        if ((to - from).magnitude < 0.05f)
+        {
+            return false;
+        }
+
+        // LinecastNonAlloc в Unity нет — луч пути строим через RaycastNonAlloc:
+        // Linecast == Raycast по направлению на длину вектора «игрок → место».
+        Vector3 pathDelta = to - from;
+        Ray pathRay = new Ray(from, pathDelta.normalized);
+        int hits = Physics.RaycastNonAlloc(pathRay, pathHitBuffer, pathDelta.magnitude,
+            wallMask.value != 0 ? wallMask.value : ~0, QueryTriggerInteraction.Ignore);
+
+        for (int i = 0; i < hits; i++)
+        {
+            Collider hit = pathHitBuffer[i].collider;
+
+            if (hit == null)
+            {
+                break;
+            }
+
+            // ── Ручной режим: любой коллайдер выбранных слоёв перекрывает путь ──
+            if (wallMask.value != 0)
+            {
+                lastPathWallHit = hit;
+                return true;
+            }
+
+            // ── АВТО-режим: те же исключения, что у проверки места ──
+
+            // Собственный предмет: коллайдеры выключены на время переноса,
+            // но страховка лишней не бывает (и стулья переносимого стола — дети).
+            if (IsOwnCollider(hit) ||
+                (movingCounter != null && hit.transform.IsChildOf(movingCounter.transform)))
+            {
+                continue;
+            }
+
+            // Динамические тела (открытая створка двери, физический реквизит) —
+            // не стены: путь через открытый проём остаётся свободным.
+            Rigidbody hitBody = hit.attachedRigidbody;
+
+            if (hitBody != null && !hitBody.isKinematic)
+            {
+                continue;
+            }
+
+            // Мебель/стулья/игрок/клиенты/предметы на станциях — не стены:
+            // до клетки ЗА соседней станцией дотянуться можно (ставится она
+            // туда по решению сетки, а не физики).
+            if (hit.GetComponentInParent<BaseCounter>() != null ||
+                hit.GetComponentInParent<Chair>() != null ||
+                hit.GetComponentInParent<Player>() != null ||
+                hit.GetComponentInParent<CustomerAI>() != null ||
+                hit.GetComponentInParent<KitchenObject>() != null)
+            {
+                continue;
+            }
+
+            // Пол: горизонтальная тонкая плита — луч идёт параллельно ему на
+            // высоте 1 м, отсечка — страховка на случай неровностей рельефа.
+            if (IsFloorLike(hit, wallBoxHalfExtents * 2f))
+            {
+                continue;
+            }
+
+            // Всё остальное (стены, рамы, колонны, статичный декор) — путь
+            // перекрыт: «сквозь стену» ставить нельзя.
+            lastPathWallHit = hit;
             return true;
         }
 
@@ -1221,19 +1506,30 @@ public class FurnitureMovingController : MonoBehaviour
     /// <summary>
     /// ★ v2.2: полная проверка места постановки — стена ИЛИ чужая мебель.
     /// Единственная точка входа для призрака, подтверждения и гизмо:
-    /// оба поля-«причины» чистятся в начале, поэтому лог всегда честный.
+    /// все поля-«причины» чистятся в начале, поэтому лог всегда честный.
+    /// ★ v2.9: добавлен третий род причин — ПУТЬ от игрока к месту, пересекающий
+    /// стену (постановка «сквозь стену»). Место может быть свободно, но если
+    /// дотянуться до него можно только через стену — постановка блокируется.
     /// </summary>
     private bool IsPlacementBlocked(Vector3 testPosition)
     {
         lastWallHit = null;
         lastFurnitureHit = null;
+        lastPathWallHit = null;
 
         if (IsOverlappingWall(testPosition))
         {
             return true;
         }
 
-        return IsOverlappingOtherFurniture(testPosition);
+        if (IsOverlappingOtherFurniture(testPosition))
+        {
+            return true;
+        }
+
+        // ★ v2.9: место свободно, но дотянуться до него можно только СКВОЗЬ
+        // стену — такая постановка запрещена.
+        return IsPathCrossingWall(testPosition);
     }
 
     /// <summary>
@@ -1474,6 +1770,7 @@ public class FurnitureMovingController : MonoBehaviour
         hasBlockedCell = false;
         lastWallHit = null;
         lastFurnitureHit = null;
+        lastPathWallHit = null;
 
         // ★ v2.4: сброс стенового режима.
         isMovingWall = false;

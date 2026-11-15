@@ -4,23 +4,99 @@ using UnityEditor;
 using System.Collections.Generic;
 
 /// <summary>
-/// GridSnapEditor v2.0 «Editor Mover» — перемещение мебели и стен ПРЯМО В РЕДАКТОРЕ Unity
+/// GridSnapEditor v2.5 «Editor Mover» — перемещение мебели и стен ПРЯМО В РЕДАКТОРЕ Unity
 /// (edit mode, Scene view), с тем же снапом, что и в игре:
 ///
 /// - Обычная мебель (BaseCounter без WallPiece) прилипает к ЦЕНТРУ КЛЕТКИ сетки.
-/// - Стены (BaseCounter с WallPiece, маркер из фичи «Стены по рёбрам сетки» v1.6)
-///   прилипают к РЕБРАМ — границам МЕЖДУ клетками — и друг к другу:
-///   ближайший узел сетки → 4 ребра вокруг → дистанция ДО СЕГМЕНТА (не узла),
-///   магнит ×0.5 к ребру с занятым коллинеарным соседом (стена продолжает линию),
-///   рёбра, занятые другими стенами, пропускаются. Поворот выравнивается вдоль
-///   ребра (0/90) по длинной оси геометрии — пивот префаба может быть где угодно.
+/// - Стены (объекты с маркером WallPiece) прилипают к РЕБРАМ — границам МЕЖДУ
+///   клетками — и друг к другу: ближайший узел сетки → рёбра вокруг → дистанция
+///   ДО СЕГМЕНТА (не узла), магнит ×0.5 к ребру с занятым коллинеарным соседом
+///   (стена продолжает линию), рёбра, занятые другими стенами, пропускаются.
+///   ★ BaseCounter на стене БОЛЬШЕ НЕ НУЖЕН: маркер WallPiece самодостаточен.
+///   ★ Поворот стены при переносе НЕ МЕНЯЕТСЯ (см. v2.5 ниже).
+///
+/// ЧТО ИСПРАВИЛО v2.5 (перестановка не меняет поворот + стене не нужен BaseCounter):
+/// Раньше ребро ставило стене позицию И ПОВОРОТ ЦЕЛИКОМ (PlaceWallOnEdgeGeometry
+/// вызывал SetPositionAndRotation с каноничным yaw ребра, а клавиша R циклила
+/// ориентацию) — стену «переворачивало» при переносе через поперечные рёбра.
+/// Теперь: 1) ориентацию цели определяет САМА СТЕНА — кандидатами считаются только
+/// рёбра, параллельные её текущему длинному плечу (WallRunsAlongX), поэтому снап
+/// физически не может повернуть стену; 2) PlaceWallOnEdgeGeometry пишет ТОЛЬКО
+/// position — rotation остаётся ровно таким, каким был. Повернуть стену можно
+/// обычным инструментом Rotate (E) — снап сам подхватит новую ориентацию.
+/// Плюс стены больше НЕ требуют BaseCounter: хватание в Scene view, снимок
+/// занятости, «выровнять выделенное/всю сцену» и подсказка выделения работают
+/// по маркеру WallPiece (стене он был нужен только старому игровому пайплайну —
+/// выбор лучом, T-перенос, покупка и сейв расстановки — всё это для стен закрыто).
+///
+/// ПОЧЕМУ v2.1 ОТЛИЧАЕТСЯ МЕХАНИЗМОМ (важно):
+/// v2.0 пыталась ПЕРЕХВАТИТЬ мышь через HandleUtility.AddDefaultControl и проверку
+/// nearestControl == свой controlID. Это проигрывает встроенному Move-инструменту Unity:
+/// он сам регистрирует контрол на «теле» объекта и обрабатывает перетаскивание телом
+/// РАНЬШЕ кастомных duringSceneGui-колбэков. Итог у пользователя: объект «берётся,
+/// но движется свободно, без прилипания» — двигал его не наш инструмент, а Unity.
+///
+/// v2.1 НЕ захватывает мышь ВООБЩЕ. Схема «пост-коррекции»:
+/// 1. Встроенный инструмент двигает объект как обычно (тело, стрелки, Rect-инструмент —
+///    любой способ; кастомные duringSceneGui-колбэки вызываются ПОСЛЕ встроенной
+///    обработки событий, поэтому мы видим результат каждого кадра перетаскивания).
+/// 2. В MouseDrag мы читаем, ЧТО сдвинул встроенный инструмент с начала переноса:
+///    - сдвиг по X и Z (перетаскивание телом/плоскостью) → снапим обе горизонтальные оси;
+///    - сдвиг только по X или только по Z (тянем стрелку) → снапим ТОЛЬКО эту ось,
+///      ограничение оси стрелки сохраняется;
+///    - сдвиг только по Y (стрелка вверх) → не мешаем поднимать/опускать объект.
+///    Если встроенный перенос по какой-то причине не сработал, объект двигаем сами
+///    от луча курсора — снап работает в обоих мирах.
+/// 3. MouseUp: финальное положение уже на сетке; undo-группы схлопываются в один Ctrl+Z.
+///
+/// ЧТО ИСПРАВИЛО v2.2 (баг «не работает со стенами»):
+/// В v2.1 стены снапились только когда встроенный инструмент сдвинул объект по ОБЕИМ
+/// горизонтальным осям сразу (guard dragIsWall && !bothAxes && !freeMode). При камере
+/// сбоку тело стены едет в плоскости экрана (X+Y, movedZ == false), при горизонтальном
+/// протаскивании — только по X — и стены молча пропускали снап, а мебель в тех же
+/// условиях работала. Теперь стены снапятся при ЛЮБОЙ горизонтальной составляющей
+/// переноса: цель всё равно считается от луча курсора, а ось-ограничение стрелки
+/// к стенам неприменимо (ребро ставит позицию И поворот целиком). Плюс защита от
+/// «скользящего» луча: при виде сбоку пересечение луча с горизонтальной плоскостью
+/// уходит на километры — в этом случае цель берётся из текущей позиции объекта,
+/// иначе стену уносило к границе сетки.
+///
+/// ЧТО ИСПРАВИЛО v2.3 (регрессия «станции не двигаются по сетке»):
+/// movedX/movedZ вычислялись по сдвигу ВСТРОЕННОГО инструмента. Но перетаскивание
+/// ТЕЛОМ объекта Unity делает в плоскости ЭКРАНА: на наклонной камере это мировой
+/// X+Y, Z почти не меняется → movedZ == false → ось-кламп прибивал Z станции к
+/// стартовому значению, и станция замирала (при неизменной клетке X — стояла вовсе;
+/// в v2.0 этого не было: мышь перехватывалась, и снап всегда шёл по обеим осям).
+/// Отличаем настоящую СТРЕЛКУ от телесного переноса: стрелка сдвигает объект строго
+/// по одной мировой оси БЕЗ вертикальной составляющей (наши поправки Y не трогают,
+/// поэтому delta.y — чистый сигнал встроенного инструмента). Любой сдвиг по Y или
+/// сразу по обеим горизонтальным осям = телесный перенос → снапим обе оси по лучу
+/// курсора. Стены не тронуты: кламп им неприменим, guard пропускает любую
+/// горизонтальную составляющую.
+///
+/// ЧТО ИСПРАВИЛО v2.4 (настоящая первопричина «не работает»):
+/// Пост-коррекция v2.1+ целиком зависела от того, что встроенный Move-инструмент
+/// двигает объект. Но телом он тащит только ЗАРАНЕЕ выделенный объект: мы выделяем
+/// его в MouseDown — позже, чем инструмент решает, за что держится. Поэтому при
+/// прямом хвате и перетаскивании встроенный инструмент НЕ ДВИГАЕТ ничего: delta == 0
+/// каждый кадр. В v2.1 мебель всё равно двигала наша логика от луча курсора
+/// (fallback «двигаем сами, если встроенный не сработал»). В v2.2 guard
+/// «if (!useX && !useZ) return» стал выходить ДО fallback-а при нулевом сдвиге —
+/// и мебель замерла (фикс v2.3 про кламп до этого места не доходил). Стены не
+/// двигались по той же причине ещё с v1-го guard-а v2.1. Теперь: если к первому
+/// кадру перетаскивания встроенный инструмент ничего не сдвинул — включается
+/// ЛИПКИЙ самостоятельный перенос «за курсором» до конца перетаскивания
+/// (обе оси, как в работавшем v2.0). Если встроенный тащит — работает
+/// эвристика v2.3 (стрелка/тело).
 ///
 /// КАК ПОЛЬЗОВАТЬСЯ:
 /// - Схвати объект мышью в Scene view и тащи — позиция снапится в реальном времени
 ///   (зелёная подсветка — свободно, красная — клетка/ребро занято ДРУГИМ объектом).
-/// - Стрелки Move-инструмента тоже работают: после отпускания объект доехает до сетки.
-/// - R во время переноса стены — цикл ориентации: авто → вдоль X → вдоль Z (как в игре).
-/// - Esc во время переноса — отмена (объект вернётся на место до переноса).
+/// - Стрелки Move-инструмента тоже снапятся вживую, с сохранением ограничения оси.
+/// - Поворот стены при переносе НЕ меняется никогда: снап предлагает только рёбра,
+///   параллельные текущей ориентации стены. Повернуть стену — инструментом Rotate
+///   (E) до переноса; снап подхватит новую ориентацию сам.
+/// - Esc во время переноса — отмена (после отпускания мыши объект вернётся на место).
 /// - Меню Tools → Kitchen Mover: выключатель снапа, «выровнять выделенное», «выровнять всё».
 ///
 /// ВАЖНО:
@@ -37,18 +113,31 @@ public static class GridSnapEditor
     private const string ToggleMenuPath = "Tools/Kitchen Mover/Снап-перетаскивание в редакторе";
     private const float ClickEpsilonPx = 2f;   // меньше этого движения — это клик, а не перенос
     private const float GrabRayDistance = 5000f;
+    private const float AxisDeltaEpsilon = 0.001f; // порог «встроенный инструмент сдвинул ось»
+    // Луч почти параллелен плоскости переноса (вид сбоку) — пересечение ненадёжно.
+    private const float ParallelRayEpsilon = 0.08f;
+    // Пересечение дальше этого расстояния — «луч в небо» у горизонта, цель бракуем.
+    private const float MaxDragPlaneDistance = 1000f;
 
     // ── Состояние живого переноса ──
-    private static BaseCounter dragCounter;
+    // ★ v2.5: Component, а не BaseCounter — стены могут БЕЗ BaseCounter
+    // (хватаем их по маркеру WallPiece). Мебель по-прежнему несёт BaseCounter.
+    private static Component dragCounter;
+    private static bool dragActive;
     private static bool dragIsWall;
     private static Plane dragPlane;
     private static Vector3 grabOffset;
     private static Vector3 preDragPosition;
     private static Quaternion preDragRotation;
     private static float dragDistancePx;
-    private static int wallOrientationOverride; // 0 — авто, 1 — только AlongX, 2 — только AlongZ
-    private static bool undoRecorded;
     private static bool dragChangedObject;
+    private static bool dragCancelled;
+    // v2.4: встроенный инструмент не тащит объект (не был выделен до клика) —
+    // до конца перетаскивания двигаем его сами от луча курсора. Липкий, потому что
+    // собственные поправки следующего кадра иначе выглядели бы как «стрелка».
+    private static bool selfMoveMode;
+    private static int undoGroup;
+    private static Vector2 lastMousePos;
 
     // Геометрическая занятость на момент старта переноса (остальные объекты).
     private static HashSet<GridPositioningSystem.WallEdgeKey> dragOccupiedEdges;
@@ -65,14 +154,6 @@ public static class GridSnapEditor
     private static Vector3 previewEdgeB;
     private static Vector3 previewEdgeMid;
     private static float previewNodeSize;
-
-    // ── Safety net: позиции выделенных счётчиков на MouseDown (для снапа после
-    // перетаскивания стрелками Move-инструмента, когда мы не перехватили мышь) ──
-    private static List<BaseCounter> passiveWatched = new List<BaseCounter>();
-    private static List<Vector3> passiveWatchedPos = new List<Vector3>();
-    private static List<Quaternion> passiveWatchedRot = new List<Quaternion>();
-
-    private static int defaultControlId;
 
     static GridSnapEditor()
     {
@@ -93,17 +174,10 @@ public static class GridSnapEditor
         Event e = Event.current;
         if (e == null) return;
 
-        // Layout: заявляем «пустой» контрол по умолчанию. Благодаря этому клик по ТЕЛУ
-        // объекта достаётся нам, а клик по стрелкам/плоскостям Move-инструмента — им
-        // (у хэндлов свой ближайший контрол, AddDefaultControl имеет низший приоритет).
-        if (e.type == EventType.Layout)
-        {
-            defaultControlId = GUIUtility.GetControlID(FocusType.Passive);
-            HandleUtility.AddDefaultControl(defaultControlId);
-            return;
-        }
-
-        switch (e.type)
+        // rawType, а не type: если встроенный инструмент «съел» событие через Use(),
+        // мы всё равно видим, что это был за жест. Пост-коррекция не требует
+        // захватывать мышь — поэтому мы не конкурируем с Move-инструментом вообще.
+        switch (e.rawType)
         {
             case EventType.MouseDown:
                 OnMouseDown(e);
@@ -137,185 +211,284 @@ public static class GridSnapEditor
     {
         // Хвостовой страховочный случай: прошлый перенос не завершился (MouseUp ушёл
         // мимо окна) — тихо завершаем его, прежде чем начинать новый.
-        if (dragCounter != null)
+        if (dragActive)
         {
             EndDrag();
         }
 
         if (e.button != 0 || e.alt || e.command || e.control) return;
-        if (HandleUtility.nearestControl != defaultControlId) return; // клик по хэндлам — не наш
-
-        RememberPassiveSelection();
 
         Ray ray = HandleUtility.GUIPointToWorldRay(e.mousePosition);
         RaycastHit hit;
         if (!Physics.Raycast(ray, out hit, GrabRayDistance)) return;
 
-        BaseCounter counter = hit.collider != null ? hit.collider.GetComponentInParent<BaseCounter>() : null;
-        if (counter == null) return;
+        // ★ v2.5: стены хватаем по маркеру WallPiece — BaseCounter на стене больше
+        // не нужен (он был нужен только старому игровому пайплайну: выбор лучом,
+        // T-перенос, покупка — всё это для стен запрещено). Мебель — по BaseCounter.
+        Component grabbed = hit.collider != null ? hit.collider.GetComponentInParent<WallPiece>() : null;
+        bool grabbedIsWall = grabbed != null;
+
+        if (grabbed == null)
+        {
+            grabbed = hit.collider != null ? hit.collider.GetComponentInParent<BaseCounter>() : null;
+        }
+
+        if (grabbed == null) return;
 
         GridPositioningSystem grid = FindActiveGrid();
         if (grid == null) return;
 
-        dragCounter = counter;
-        dragIsWall = WallPiece.IsWall(counter);
-        preDragPosition = counter.transform.position;
-        preDragRotation = counter.transform.rotation;
+        dragCounter = grabbed;
+        dragActive = true;
+        dragIsWall = grabbedIsWall;
+        preDragPosition = dragCounter.transform.position;
+        preDragRotation = dragCounter.transform.rotation;
         dragPlane = new Plane(Vector3.up, new Vector3(0f, hit.point.y, 0f));
-        grabOffset = counter.transform.position - hit.point;
+        grabOffset = dragCounter.transform.position - hit.point;
         dragDistancePx = 0f;
-        undoRecorded = false;
         dragChangedObject = false;
-        wallOrientationOverride = 0;
+        dragCancelled = false;
         hasPreview = false;
+        selfMoveMode = false;
+        lastMousePos = e.mousePosition;
 
-        BuildOccupancySnapshot(grid, counter);
+        BuildOccupancySnapshot(grid, dragCounter);
 
-        Selection.activeGameObject = counter.gameObject;
-        Tools.hidden = true; // прячем стрелки Move-инструмента, пока тащим сами
-        e.Use();
+        undoGroup = Undo.GetCurrentGroup();
+        Undo.RecordObject(dragCounter.transform, "Перенос по сетке (Editor)");
+
+        Selection.activeGameObject = dragCounter.gameObject;
+        // ВАЖНО: событие НЕ используем, инструменты НЕ прячем — встроенный перенос
+        // должен отработать. Наша коррекция случится после него в MouseDrag.
     }
 
     private static void OnMouseDrag(Event e)
     {
-        if (dragCounter == null) return;
-        if (e.button != 0)
+        if (!dragActive || dragCounter == null) return;
+        if (e.button != 0) return; // другие кнопки — камера, не мешаем
+
+        if (dragCancelled)
         {
-            e.Use();
+            e.Use(); // перенос отменён — держим объект на месте до отпускания мыши
             return;
         }
 
         dragDistancePx += Mathf.Abs(e.delta.x) + Mathf.Abs(e.delta.y);
+        lastMousePos = e.mousePosition;
 
-        // Пока это ещё «клик», а не перенос — ничего не двигаем (и не пишем Undo).
+        // Пока это ещё «клик», а не перенос — ничего не двигаем.
         if (dragDistancePx <= ClickEpsilonPx)
         {
             e.Use();
             return;
         }
 
-        if (!undoRecorded)
+        // Что сдвинул встроенный инструмент с начала переноса? Наши поправки Y не
+        // меняют (высоту держим как до переноса), поэтому delta.y — чистый сигнал
+        // встроенного инструмента, по нему отличаем стрелку от телесного переноса.
+        Vector3 delta = dragCounter.transform.position - preDragPosition;
+        bool movedX = Mathf.Abs(delta.x) > AxisDeltaEpsilon;
+        bool movedZ = Mathf.Abs(delta.z) > AxisDeltaEpsilon;
+        bool movedY = Mathf.Abs(delta.y) > AxisDeltaEpsilon;
+
+        // Стрелка вверх (только Y) — не мешаем поднимать/опускать объект.
+        if (!movedX && !movedZ && movedY)
         {
-            Undo.RecordObject(dragCounter.transform, "Перенос по сетке (Editor)");
-            undoRecorded = true;
+            hasPreview = false;
+            e.Use();
+            return;
         }
 
-        ApplySnappedPosition(e.mousePosition);
+        // v2.4: встроенный инструмент не тащит — двигаем сами «за курсором».
+        if (selfMoveMode)
+        {
+            ApplySnappedPosition(e.mousePosition, true, true);
+            e.Use();
+            return;
+        }
+
+        // Ничего не сдвинуто к первому кадру перетаскивания → встроенный инструмент
+        // НЕ тащит объект (он тащит телом только заранее выделенный). Включаем
+        // липкий самостоятельный перенос — обе оси, как в работавшем v2.0.
+        if (!movedX && !movedZ && !movedY)
+        {
+            selfMoveMode = true;
+            ApplySnappedPosition(e.mousePosition, true, true);
+            e.Use();
+            return;
+        }
+
+        // v2.3: настоящая СТРЕЛКА сдвигает объект строго по одной мировой оси БЕЗ
+        // вертикальной составляющей. Перетаскивание ТЕЛОМ на наклонной камере едет
+        // в плоскости ЭКРАНА (X+Y или Z+Y) — наличие movedY выдаёт телесный перенос.
+        // Всё, что не чистая стрелка — телесный перенос: снапим обе горизонтальные
+        // оси по лучу курсора.
+        bool freeMove = movedY || (movedX && movedZ);
+        bool useX = freeMove || movedX;
+        bool useZ = freeMove || movedZ;
+
+        ApplySnappedPosition(e.mousePosition, useX, useZ);
         e.Use();
     }
 
     private static void OnMouseUp(Event e)
     {
-        if (dragCounter != null)
-        {
-            bool changed = dragChangedObject;
-            string movedName = dragCounter != null ? dragCounter.gameObject.name : "<объект>";
-            EndDrag();
-            e.Use();
+        if (!dragActive || dragCounter == null) return;
 
-            if (changed)
-            {
-                Debug.Log($"[GridSnap] '{movedName}' размещён по сетке (мебель — центр клетки, стены — ребро).");
-            }
-            return;
+        bool changed = dragChangedObject && !dragCancelled;
+        string movedName = dragCounter.gameObject.name;
+
+        if (dragCancelled)
+        {
+            dragCounter.transform.position = preDragPosition;
+            dragCounter.transform.rotation = preDragRotation;
         }
 
-        // SAFETY NET: если объект тащили СТРЕЛКАМИ Move-инструмента (мы не перехватывали
-        // мышь), на отпускании доезжаем до сетки — как в v1.0. Чистый клик без движения
-        // ничего не снапит.
-        SnapPassiveSelectionIfMoved();
+        EndDrag();
+
+        // Схлопываем undo-группы встроенного переноса и нашей коррекции в один шаг.
+        Undo.CollapseUndoOperations(undoGroup);
+        e.Use();
+
+        if (changed)
+        {
+            Debug.Log($"[GridSnap] '{movedName}' размещён по сетке (мебель — центр клетки, стены — ребро).");
+        }
     }
 
     private static void OnKeyDown(Event e)
     {
-        if (dragCounter == null) return;
+        if (!dragActive || dragCounter == null) return;
 
-        if (e.keyCode == KeyCode.R && dragIsWall)
+        // ★ v2.5: клавиша R убрана — перестановка не крутит стену (и случайно
+        // нажатая R больше не переворачивает её). Повернуть стену можно
+        // инструментом Rotate (E) вне переноса.
+        if (e.keyCode == KeyCode.Escape)
         {
-            wallOrientationOverride = (wallOrientationOverride + 1) % 3;
-            string mode = wallOrientationOverride == 0 ? "АВТО" : wallOrientationOverride == 1 ? "вдоль X" : "вдоль Z";
-            Debug.Log($"[GridSnap] Ориентация стены: {mode}.");
-            ApplySnappedPosition(e.mousePosition);
-            e.Use();
-        }
-        else if (e.keyCode == KeyCode.Escape)
-        {
-            CancelDrag();
+            dragCancelled = true;
+            dragCounter.transform.position = preDragPosition;
+            dragCounter.transform.rotation = preDragRotation;
+            hasPreview = false;
+            Debug.Log("[GridSnap] Перенос отменён (Esc) — объект вернётся на место после отпускания мыши.");
+            SceneView.RepaintAll();
             e.Use();
         }
     }
 
-    private static void ApplySnappedPosition(Vector2 guiPoint)
+    private static void ApplySnappedPosition(Vector2 guiPoint, bool useX, bool useZ)
     {
         GridPositioningSystem grid = FindActiveGrid();
         if (grid == null || dragCounter == null) return;
 
+        // v2.3: единственный пропуск — чистый подъём по Y. Стены снапим при ЛЮБОЙ
+        // горизонтальной составляющей: в v2.1 требовался сдвиг обеих осей, и при камере
+        // сбоку (тело стены едет по X+Y, movedZ == false) стены молча пропускали снап.
+        if (!useX && !useZ) return;
+
         Ray ray = HandleUtility.GUIPointToWorldRay(guiPoint);
-        float enter;
-        if (!dragPlane.Raycast(ray, out enter)) return;
+        Vector3 target;
+        if (TryGetDragTarget(ray, out Vector3 planePoint))
+        {
+            target = planePoint + grabOffset;
+        }
+        else
+        {
+            // Камера почти параллельна плоскости переноса (вид сбоку) или луч уходит
+            // к горизонту — grazing-луч даёт цель за сотни метров и стену уносит
+            // к границе сетки. Снапим от текущей позиции объекта.
+            target = dragCounter.transform.position;
+        }
 
-        Vector3 target = ray.GetPoint(enter) + grabOffset;
+        Vector3 before = dragCounter.transform.position;
 
+        bool placed;
         bool blocked;
         if (dragIsWall)
         {
             GridPositioningSystem.WallEdgeKey edge;
-            SnapWallGeometry(grid, dragCounter, target, wallOrientationOverride, dragOccupiedEdges, out edge, out blocked);
+            placed = SnapWallGeometry(grid, dragCounter, target, dragOccupiedEdges, out edge, out blocked);
         }
         else
         {
             Vector2Int cell;
-            SnapFurnitureGeometry(grid, dragCounter, target, dragOccupiedCells, out cell, out blocked);
+            placed = SnapFurnitureGeometry(grid, dragCounter, target, dragOccupiedCells, out cell, out blocked);
         }
 
+        if (!placed) return;
+
+        // Ось стрелки сохраняем (только мебель): тянуть X-стрелку — снапим только X.
+        // Для стен НЕ применяем: посадка на ребро целиком управляет позицией XZ
+        // (центр геометрии обязан сесть на середину ребра), частичное сохранение
+        // координат сломало бы посадку. Поворот стена при этом НЕ меняет (v2.5).
+        Vector3 after = dragCounter.transform.position;
+        Vector3 final = after;
+        if (!dragIsWall)
+        {
+            if (useX && !useZ) final = new Vector3(after.x, after.y, before.z);
+            else if (!useX && useZ) final = new Vector3(before.x, after.y, after.z);
+        }
+
+        // Высоту держим как до переноса: менять её может только стрелка вверх,
+        // а этот случай отфильтрован выше.
+        final.y = preDragPosition.y;
+        dragCounter.transform.position = final;
+
+        dragChangedObject = true;
         previewBlocked = blocked;
         hasPreview = true;
         SceneView.RepaintAll();
     }
 
-    private static void CancelDrag()
+    /// <summary>
+    /// Пересечение луча курсора с горизонтальной плоскостью переноса.
+    /// false — луч почти параллелен плоскости (вид сбоку) или пересечение подозрительно
+    /// далеко (луч уходит к горизонту): по такому лучу нельзя надёжно получить цель.
+    /// </summary>
+    private static bool TryGetDragTarget(Ray ray, out Vector3 point)
     {
-        if (dragCounter == null) return;
+        float enter;
+        if (Mathf.Abs(ray.direction.y) < ParallelRayEpsilon ||
+            !dragPlane.Raycast(ray, out enter) ||
+            enter > MaxDragPlaneDistance)
+        {
+            point = default;
+            return false;
+        }
 
-        dragCounter.transform.position = preDragPosition;
-        dragCounter.transform.rotation = preDragRotation;
-        Debug.Log("[GridSnap] Перенос отменён (Esc) — объект возвращён на место.");
-        EndDrag();
+        point = ray.GetPoint(enter);
+        return true;
     }
 
     private static void EndDrag()
     {
         dragCounter = null;
+        dragActive = false;
         dragIsWall = false;
         dragOccupiedEdges = null;
         dragOccupiedCells = null;
         hasPreview = false;
-        undoRecorded = false;
         dragChangedObject = false;
-        Tools.hidden = false;
-        passiveWatched.Clear();
+        dragCancelled = false;
+        selfMoveMode = false;
         SceneView.RepaintAll();
     }
 
     private static void OnHierarchyChanged()
     {
         // Объект переноса уничтожили (undo, удаление) — тихо завершаем перенос.
-        if (dragCounter == null && (Tools.hidden || passiveWatched.Count > 0))
+        // dragCounter == null ловит и «уничтожен» (fake-null), не только «не назначен».
+        if (dragActive && dragCounter == null)
         {
-            Tools.hidden = false;
-            passiveWatched.Clear();
-            dragOccupiedEdges = null;
-            dragOccupiedCells = null;
-            hasPreview = false;
+            EndDrag();
         }
     }
 
     private static void OnPlayModeStateChanged(PlayModeStateChange state)
     {
-        // Страховка: никакой скрытый инструмент не должен пережить вход в play mode.
-        if (state == PlayModeStateChange.EnteredPlayMode && Tools.hidden)
+        // Страховка: никакой активный перенос не должен пережить вход в play mode.
+        if (state == PlayModeStateChange.EnteredPlayMode && dragActive)
         {
-            Tools.hidden = false;
+            EndDrag();
         }
     }
 
@@ -324,17 +497,24 @@ public static class GridSnapEditor
     //  занятость — по текущим позициям объектов сцены)
     // ============================================================
 
-    private static void SnapFurnitureGeometry(
+    private static bool SnapFurnitureGeometry(
         GridPositioningSystem grid,
-        BaseCounter counter,
+        Component counter,
         Vector3 target,
         Dictionary<Vector2Int, string> occupiedCells,
         out Vector2Int cell,
         out bool blocked)
     {
+        cell = default;
+        blocked = false;
+
         float size = grid.GetCellSize();
         Vector3 origin = grid.GetGridOrigin();
         Vector2Int bounds = grid.GetGridBounds();
+
+        // Защита от кривых настроек сетки: иначе деление на ноль/негативные границы
+        // телепортируют объект в угол сцены.
+        if (size <= 0.0001f || bounds.x <= 0 || bounds.y <= 0) return false;
 
         // Зеркало GetGridPosition + зажим в границы сетки (дизайнеру не даём утащить мебель вникуда).
         int x = Mathf.Clamp(Mathf.FloorToInt((target.x - origin.x) / size), 0, bounds.x - 1);
@@ -344,7 +524,6 @@ public static class GridSnapEditor
         Vector3 snapped = grid.GetWorldPosition(cell);
         snapped.y = counter.transform.position.y;
         counter.transform.position = snapped;
-        dragChangedObject = true;
 
         previewIsWall = false;
         previewCell = cell;
@@ -352,13 +531,13 @@ public static class GridSnapEditor
         previewCellSize = size;
 
         blocked = occupiedCells != null && occupiedCells.ContainsKey(cell);
+        return true;
     }
 
     private static bool SnapWallGeometry(
         GridPositioningSystem grid,
-        BaseCounter wall,
+        Component wall,
         Vector3 target,
-        int orientationOverride,
         HashSet<GridPositioningSystem.WallEdgeKey> occupiedEdges,
         out GridPositioningSystem.WallEdgeKey edge,
         out bool blocked)
@@ -369,6 +548,14 @@ public static class GridSnapEditor
         float size = grid.GetCellSize();
         Vector3 origin = grid.GetGridOrigin();
         Vector2Int bounds = grid.GetGridBounds();
+        if (size <= 0.0001f || bounds.x <= 0 || bounds.y <= 0) return false;
+
+        // ★ v2.5: перестановка НЕ меняет поворот стены. Ориентацию цели определяет
+        // САМА СТЕНА: кандидатами считаются только рёбра, параллельные её текущему
+        // длинному плечу. Перпендикулярные рёбра не предлагаются вовсе — снап
+        // физически не может повернуть стену (в v2.4 ребро ставило стене и позицию,
+        // и каноничный поворот, а клавиша R циклила ориентацию — стена «переворачивалась»).
+        bool wallRunsAlongX = WallRunsAlongX(wall);
 
         int nodeX = Mathf.Clamp(Mathf.RoundToInt((target.x - origin.x) / size), 0, bounds.x);
         int nodeZ = Mathf.Clamp(Mathf.RoundToInt((target.z - origin.z) / size), 0, bounds.y);
@@ -382,8 +569,9 @@ public static class GridSnapEditor
         {
             bool alongX = pass == 0;
 
-            if (orientationOverride == 1 && !alongX) continue;
-            if (orientationOverride == 2 && alongX) continue;
+            // ★ v2.5: было фильтром по wallOrientationOverride (клавиша R) —
+            // стало фильтром по собственной ориентации стены.
+            if (wallRunsAlongX != alongX) continue;
 
             for (int side = -1; side <= 1; side += 2)
             {
@@ -444,7 +632,6 @@ public static class GridSnapEditor
         blocked = !bestFree.HasValue;
 
         PlaceWallOnEdgeGeometry(grid, wall, edge);
-        dragChangedObject = true;
 
         // Геометрия превью.
         Vector3 a = grid.GetWallEdgeMidpoint(edge);
@@ -469,53 +656,87 @@ public static class GridSnapEditor
         return true;
     }
 
-    /// <summary>Ставит геометрический центр стены на середину ребра, поворот — вдоль ребра.</summary>
-    private static void PlaceWallOnEdgeGeometry(GridPositioningSystem grid, BaseCounter wall, GridPositioningSystem.WallEdgeKey edge)
+    /// <summary>
+    /// ★ v2.5: ставит геометрический центр стены на середину ребра БЕЗ смены поворота.
+    /// Прошлые версии выравнивали yaw вдоль ребра (SetPositionAndRotation с каноничным
+    /// поворотом) — стену «переворачивало» при переносе. Теперь пишется ТОЛЬКО
+    /// position: rotation стены остаётся ровно таким, каким был до переноса.
+    /// </summary>
+    private static void PlaceWallOnEdgeGeometry(GridPositioningSystem grid, Component wall, GridPositioningSystem.WallEdgeKey edge)
     {
-        bool edgeAlongX = edge.axis == GridPositioningSystem.WallEdgeAxis.AlongX;
         Vector3 midpoint = grid.GetWallEdgeMidpoint(edge);
-        Quaternion alignedRotation = Quaternion.Euler(0f, ComputeEdgeAlignedYaw(wall, edgeAlongX), 0f);
         Transform t = wall.transform;
 
         Vector3 center;
         if (WallPiece.TryGetGeometryCenter(wall, out center))
         {
-            // Локальный оффсет «пивот → центр геометрии» в ТЕКУЩЕЙ ориентации,
-            // перенесённый в выровненную — на ребро садится именно геометрия.
-            Vector3 localOffset = Quaternion.Inverse(t.rotation) * (center - t.position);
-            Vector3 worldOffset = alignedRotation * localOffset;
+            // Поворот не трогаем, поэтому оффсет «пивот → центр геометрии» в мировых
+            // координатах постоянен — на середину ребра садится именно геометрия.
+            Vector3 offset = center - t.position;
 
-            t.SetPositionAndRotation(
-                new Vector3(midpoint.x - worldOffset.x, t.position.y, midpoint.z - worldOffset.z),
-                alignedRotation);
+            t.position = new Vector3(midpoint.x - offset.x, t.position.y, midpoint.z - offset.z);
         }
         else
         {
-            t.SetPositionAndRotation(
-                new Vector3(midpoint.x, t.position.y, midpoint.z),
-                alignedRotation);
+            t.position = new Vector3(midpoint.x, t.position.y, midpoint.z);
         }
     }
 
     /// <summary>
-    /// Поворот (yaw), при котором длинная ось геометрии ложится вдоль ребра:
-    /// AlongX → 0, AlongZ → 90. Зеркало GridPositioningSystem.GetEdgeAlignedYaw.
+    /// ★ v2.5: текущая ориентация стены — true, если длинная ось геометрии смотрит
+    /// вдоль мирового X (ребро AlongX), false — вдоль Z (ребро AlongZ). Зеркало
+    /// GridPositioningSystem: размеры берутся из геометрии (BoxCollider даёт их в
+    /// локальных величинах), четверть текущего поворота показывает, куда плечо
+    /// смотрит сейчас. САМ ПОВОРОТ СТЕНЫ ЭТА ФУНКЦИЯ НЕ МЕНЯЕТ.
     /// </summary>
-    private static float ComputeEdgeAlignedYaw(BaseCounter wall, bool edgeAlongX)
+    private static bool WallRunsAlongX(Component wall)
     {
         Bounds bounds;
         if (!WallPiece.TryGetGeometryBounds(wall, out bounds))
         {
-            return 0f;
+            return true;
         }
 
         float currentYaw = NormalizeAngleTo360(wall.transform.rotation.eulerAngles.y);
         int quarter = Mathf.RoundToInt(currentYaw / 90f) % 2;
-        bool longAxisIsWorldX = (quarter == 0)
+
+        return (quarter == 0)
             ? bounds.size.x >= bounds.size.z
             : bounds.size.z >= bounds.size.x;
+    }
 
-        return (longAxisIsWorldX == edgeAlongX) ? 0f : 90f;
+    /// <summary>
+    /// ★ v2.5: локальное зеркало GridPositioningSystem.DeriveWallEdgeFromCurrentPosition,
+    /// работающее с Component: стены в редакторе могут быть БЕЗ BaseCounter, а версия
+    /// GPS принимает только BaseCounter. Логика идентична v1.6: геометрический центр
+    /// (падает на середину ребра) + ориентация длинной оси по размерам геометрии.
+    /// </summary>
+    private static GridPositioningSystem.WallEdgeKey DeriveWallEdgeFromCurrentPosition(
+        GridPositioningSystem grid, Component wall)
+    {
+        Vector3 probe = wall.transform.position;
+
+        if (WallPiece.TryGetGeometryCenter(wall, out Vector3 center))
+        {
+            probe = center;
+        }
+
+        bool longAxisIsWorldX = WallRunsAlongX(wall);
+
+        float size = grid.GetCellSize();
+        Vector3 origin = grid.GetGridOrigin();
+        Vector2Int bounds = grid.GetGridBounds();
+
+        if (longAxisIsWorldX)
+        {
+            int lineZ = Mathf.Clamp(Mathf.RoundToInt((probe.z - origin.z) / size), 0, bounds.y);
+            int cellX = Mathf.Clamp(Mathf.FloorToInt((probe.x - origin.x) / size), 0, bounds.x - 1);
+            return new GridPositioningSystem.WallEdgeKey(cellX, lineZ, GridPositioningSystem.WallEdgeAxis.AlongX);
+        }
+
+        int lineX = Mathf.Clamp(Mathf.RoundToInt((probe.x - origin.x) / size), 0, bounds.x);
+        int cellZ = Mathf.Clamp(Mathf.FloorToInt((probe.z - origin.z) / size), 0, bounds.y - 1);
+        return new GridPositioningSystem.WallEdgeKey(lineX, cellZ, GridPositioningSystem.WallEdgeAxis.AlongZ);
     }
 
     private static bool HasOccupiedCollinearNeighbor(GridPositioningSystem.WallEdgeKey edge, HashSet<GridPositioningSystem.WallEdgeKey> occupiedEdges)
@@ -562,7 +783,7 @@ public static class GridSnapEditor
     /// Снимок занятости ПО ТЕКУЩИМ ПОЗИЦИЯМ объектов (реестры сетки в edit mode пусты).
     /// Рёбра — со всех WallPiece сцены, кроме переносимого; клетки — со всей мебели.
     /// </summary>
-    private static void BuildOccupancySnapshot(GridPositioningSystem grid, BaseCounter exceptCounter)
+    private static void BuildOccupancySnapshot(GridPositioningSystem grid, Component exceptObject)
     {
         dragOccupiedEdges = new HashSet<GridPositioningSystem.WallEdgeKey>();
 
@@ -571,12 +792,11 @@ public static class GridSnapEditor
 
         foreach (WallPiece wp in walls)
         {
-            if (wp == null) continue;
+            // ★ v2.5: рёбра собираем по маркеру WallPiece — BaseCounter на стене
+            // не нужен (стены бывают и без него). Ребро выводим локальным зеркалом.
+            if (wp == null || wp == exceptObject) continue;
 
-            BaseCounter bc = wp.GetComponent<BaseCounter>();
-            if (bc == null || bc == exceptCounter) continue;
-
-            dragOccupiedEdges.Add(grid.DeriveWallEdgeFromCurrentPosition(bc));
+            dragOccupiedEdges.Add(DeriveWallEdgeFromCurrentPosition(grid, wp));
         }
 
         dragOccupiedCells = new Dictionary<Vector2Int, string>();
@@ -586,7 +806,7 @@ public static class GridSnapEditor
 
         foreach (BaseCounter bc in counters)
         {
-            if (bc == null || bc == exceptCounter || WallPiece.IsWall(bc)) continue;
+            if (bc == null || bc == exceptObject || WallPiece.IsWall(bc)) continue;
 
             Vector2Int cell = grid.GetGridPosition(bc.transform.position);
             dragOccupiedCells[cell] = bc.gameObject.name;
@@ -594,52 +814,7 @@ public static class GridSnapEditor
     }
 
     // ============================================================
-    //  SAFETY NET: снап после перетаскивания стрелками Move-инструмента
-    // ============================================================
-
-    private static void RememberPassiveSelection()
-    {
-        passiveWatched.Clear();
-        passiveWatchedPos.Clear();
-        passiveWatchedRot.Clear();
-
-        GameObject[] selected = Selection.gameObjects;
-        if (selected == null) return;
-
-        foreach (GameObject go in selected)
-        {
-            if (go == null) continue;
-
-            BaseCounter counter = go.GetComponentInParent<BaseCounter>();
-            if (counter == null || passiveWatched.Contains(counter)) continue;
-
-            passiveWatched.Add(counter);
-            passiveWatchedPos.Add(counter.transform.position);
-            passiveWatchedRot.Add(counter.transform.rotation);
-        }
-    }
-
-    private static void SnapPassiveSelectionIfMoved()
-    {
-        for (int i = 0; i < passiveWatched.Count; i++)
-        {
-            BaseCounter counter = passiveWatched[i];
-            if (counter == null) continue;
-
-            bool moved = Vector3.SqrMagnitude(counter.transform.position - passiveWatchedPos[i]) > 0.0001f ||
-                         Quaternion.Angle(counter.transform.rotation, passiveWatchedRot[i]) > 0.5f;
-            if (!moved) continue;
-
-            SnapCounterStatic(counter);
-        }
-
-        passiveWatched.Clear();
-        passiveWatchedPos.Clear();
-        passiveWatchedRot.Clear();
-    }
-
-    // ============================================================
-    //  СТАТИЧЕСКИЙ СНАП (меню / safety net) — совместимый публичный API v1.0
+    //  СТАТИЧЕСКИЙ СНАП (меню) — совместимый публичный API v1.0
     // ============================================================
 
     /// <summary>Прилипает один счётчик: мебель — в клетку, стену — на ребро. Возвращает true, если позиция изменилась.</summary>
@@ -648,7 +823,7 @@ public static class GridSnapEditor
         return SnapCounterStatic(counter, registerUndo);
     }
 
-    private static bool SnapCounterStatic(BaseCounter counter, bool registerUndo = true)
+    private static bool SnapCounterStatic(Component counter, bool registerUndo = true)
     {
         if (counter == null) return false;
 
@@ -676,7 +851,7 @@ public static class GridSnapEditor
             bool blocked;
 
             HashSet<GridPositioningSystem.WallEdgeKey> occupied = CollectWallEdges(grid, counter);
-            SnapWallGeometry(grid, counter, probe, 0, occupied, out edge, out blocked);
+            SnapWallGeometry(grid, counter, probe, occupied, out edge, out blocked);
 
             if (blocked)
             {
@@ -695,15 +870,36 @@ public static class GridSnapEditor
                Quaternion.Angle(counter.transform.rotation, rotBefore) > 0.5f;
     }
 
-    /// <summary>Прилипает всю мебель и все стены в активной сцене. Возвращает количество перемещённых.</summary>
+    /// <summary>
+    /// Прилипает всю мебель и все стены в активной сцене. Возвращает количество перемещённых.
+    /// ★ v2.5: стены собираются по маркеру WallPiece (BaseCounter на стене не нужен),
+    /// мебель — по BaseCounter; объект с обоими компонентами снапится один раз.
+    /// </summary>
     public static int SnapAllCountersInScene()
     {
+        HashSet<Object> processed = new HashSet<Object>();
+        int snappedCount = 0;
+
+        WallPiece[] walls = Object.FindObjectsByType<WallPiece>(
+            FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+
+        foreach (WallPiece wp in walls)
+        {
+            if (wp == null || !processed.Add(wp)) continue;
+
+            if (SnapCounterStatic(wp, registerUndo: true))
+            {
+                snappedCount++;
+            }
+        }
+
         BaseCounter[] counters = Object.FindObjectsByType<BaseCounter>(
             FindObjectsInactive.Exclude, FindObjectsSortMode.None);
 
-        int snappedCount = 0;
         foreach (BaseCounter counter in counters)
         {
+            if (counter == null || WallPiece.IsWall(counter) || !processed.Add(counter)) continue;
+
             if (SnapCounterStatic(counter, registerUndo: true))
             {
                 snappedCount++;
@@ -713,7 +909,7 @@ public static class GridSnapEditor
         return snappedCount;
     }
 
-    private static HashSet<GridPositioningSystem.WallEdgeKey> CollectWallEdges(GridPositioningSystem grid, BaseCounter exceptCounter)
+    private static HashSet<GridPositioningSystem.WallEdgeKey> CollectWallEdges(GridPositioningSystem grid, Component exceptObject)
     {
         HashSet<GridPositioningSystem.WallEdgeKey> edges = new HashSet<GridPositioningSystem.WallEdgeKey>();
 
@@ -722,18 +918,16 @@ public static class GridSnapEditor
 
         foreach (WallPiece wp in walls)
         {
-            if (wp == null) continue;
+            // ★ v2.5: по маркеру WallPiece, без требования BaseCounter.
+            if (wp == null || wp == exceptObject) continue;
 
-            BaseCounter bc = wp.GetComponent<BaseCounter>();
-            if (bc == null || bc == exceptCounter) continue;
-
-            edges.Add(grid.DeriveWallEdgeFromCurrentPosition(bc));
+            edges.Add(DeriveWallEdgeFromCurrentPosition(grid, wp));
         }
 
         return edges;
     }
 
-    private static Dictionary<Vector2Int, string> CollectOccupiedCells(BaseCounter exceptCounter)
+    private static Dictionary<Vector2Int, string> CollectOccupiedCells(Component exceptCounter)
     {
         Dictionary<Vector2Int, string> cells = new Dictionary<Vector2Int, string>();
 
@@ -759,13 +953,12 @@ public static class GridSnapEditor
 
     private static GridPositioningSystem FindActiveGrid()
     {
-        if (GridPositioningSystem.Instance != null)
-        {
-            return GridPositioningSystem.Instance;
-        }
+        GridPositioningSystem inst = GridPositioningSystem.Instance;
+        if (inst != null && inst.isActiveAndEnabled) return inst;
 
+        // Отключенная/умирающая сетка не годится для снапа — ищем живую в сцене.
         GridPositioningSystem[] grids = Object.FindObjectsByType<GridPositioningSystem>(
-            FindObjectsInactive.Include, FindObjectsSortMode.None);
+            FindObjectsInactive.Exclude, FindObjectsSortMode.None);
         return grids != null && grids.Length > 0 ? grids[0] : null;
     }
 
@@ -809,7 +1002,14 @@ public static class GridSnapEditor
         GameObject selected = Selection.activeGameObject;
         if (selected == null) return;
 
-        BaseCounter counter = selected.GetComponentInParent<BaseCounter>();
+        // ★ v2.5: стены — по маркеру WallPiece (BaseCounter на стене не нужен).
+        Component counter = selected.GetComponentInParent<WallPiece>();
+
+        if (counter == null)
+        {
+            counter = selected.GetComponentInParent<BaseCounter>();
+        }
+
         if (counter == null) return;
 
         GridPositioningSystem grid = FindActiveGrid();
@@ -819,7 +1019,7 @@ public static class GridSnapEditor
 
         if (WallPiece.IsWall(counter))
         {
-            GridPositioningSystem.WallEdgeKey edge = grid.DeriveWallEdgeFromCurrentPosition(counter);
+            GridPositioningSystem.WallEdgeKey edge = DeriveWallEdgeFromCurrentPosition(grid, counter);
             Vector3 a = grid.GetWallEdgeMidpoint(edge);
             Vector3 b = a;
 
@@ -883,7 +1083,14 @@ public static class GridSnapEditor
         {
             if (go == null) continue;
 
-            BaseCounter counter = go.GetComponentInParent<BaseCounter>();
+            // ★ v2.5: стены — по маркеру WallPiece (BaseCounter на стене не нужен).
+            Component counter = go.GetComponentInParent<WallPiece>();
+
+            if (counter == null)
+            {
+                counter = go.GetComponentInParent<BaseCounter>();
+            }
+
             if (counter == null || processed.Contains(counter)) continue;
 
             processed.Add(counter);
@@ -929,7 +1136,8 @@ public static class GridSnapEditor
     private static bool ValidateLegacySnapSelected()
     {
         return !Application.isPlaying && Selection.activeGameObject != null &&
-               Selection.activeGameObject.GetComponentInParent<BaseCounter>() != null;
+               (Selection.activeGameObject.GetComponentInParent<BaseCounter>() != null ||
+                Selection.activeGameObject.GetComponentInParent<WallPiece>() != null);
     }
 
     [MenuItem("Tools/Snap All Counters to Grid", false, 111)]

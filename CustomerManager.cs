@@ -16,6 +16,18 @@ public class CustomerManager : MonoBehaviour
     [SerializeField] private int minGroupSize = 1;
     [SerializeField] private int maxGroupSize = 4;
 
+    [Header("Типы клиентов (особенности)")]
+    [Tooltip("Гоблин — базовый клиент без особенностей: сел → один заказ → ел → ушёл.\nВес = вероятность относительно суммы весов (70 + 20 + 10 → 70% шанс).")]
+    [SerializeField] private float goblinWeight = 70f;
+    [Tooltip("Кобольды НЕ приходят по одному: группа из 2+ человек (нужен стол с 2+ стульями, иначе уйдут недовольными). Вся группа заказывает ОДНО И ТО ЖЕ блюдо.")]
+    [SerializeField] private float koboldWeight = 20f;
+    [Tooltip("Префаб кобольда. Если не назначен — используется базовый customerPrefab (тип работает, визуал общий).")]
+    [SerializeField] private GameObject koboldPrefab;
+    [Tooltip("Призрак приходит ОДИН и делает несколько заказов ПОДРЯД (число — в CustomerAI.ghostConsecutiveOrders, по умолчанию 3).\nНе ест и не оставляет грязной посуды.")]
+    [SerializeField] private float ghostWeight = 10f;
+    [Tooltip("Префаб призрака. Если не назначен — используется базовый customerPrefab (тип работает, визуал общий).")]
+    [SerializeField] private GameObject ghostPrefab;
+
     [Header("Прогрессия сложности по дням")]
     [Tooltip("Насколько секунд короче интервал спавна за каждый пройденный день")]
     [SerializeField] private float spawnIntervalReductionPerDay = 0.5f;
@@ -285,7 +297,13 @@ public class CustomerManager : MonoBehaviour
         // через лимит «customerList.Count + groupSize > maxCustomers» навсегда.
         customerList.RemoveAll(c => c == null);
 
-        int groupSize = UnityEngine.Random.Range(minGroupSize, maxGroupSize + 1);
+        // ТИП КЛИЕНТОВ: одна спавн-волна — всегда гости ОДНОГО типа (группа гоблинов,
+        // группа кобольдов или один призрак). Смешанные группы не предусмотрены.
+        CustomerAI.CustomerType spawnType = RollCustomerType();
+
+        // Размер группы зависит от типа: гоблины — общий диапазон, кобольды — всегда
+        // минимум двое, призрак — всегда один (см. GetGroupSizeForType).
+        int groupSize = GetGroupSizeForType(spawnType);
 
         // Не превышаем лимит клиентов
         if (customerList.Count + groupSize > maxCustomers)
@@ -296,6 +314,12 @@ public class CustomerManager : MonoBehaviour
 
         // Заспавнили группу клиентов сразу — до поиска стола. Если стола не найдётся,
         // отправим их в очередь, а не отменим спавн (иначе потерянные Instantiate'ы).
+        // ПРЕФАБ ПО ТИПУ: у кобольда/призрака свой префаб (koboldPrefab/ghostPrefab),
+        // если он назначен; иначе базовый customerPrefab — тип всё равно работает,
+        // просто визуал общий. Каждый клиент получает тип через SetCustomerType
+        // сразу после Instantiate, до первого Update — особенности подхватываются сразу.
+        GameObject typePrefab = GetPrefabForType(spawnType);
+
         List<CustomerAI> group = new List<CustomerAI>();
         for (int i = 0; i < groupSize; i++)
         {
@@ -306,12 +330,19 @@ public class CustomerManager : MonoBehaviour
             );
 
             GameObject customerObject = Instantiate(
-                customerPrefab,
+                typePrefab,
                 spawnPoint.position + offset,
                 Quaternion.identity
             );
 
             CustomerAI customer = customerObject.GetComponent<CustomerAI>();
+
+            // ТИП: помечаем клиента — DiningTable (зеркалирование кобольдов) и
+            // CustomerAI (серия заказов призрака) читают его при посадке.
+            customer.SetCustomerType(spawnType);
+
+            // Метка типа в имени — удобнее читать логи и искать гостей в иерархии.
+            customerObject.name = $"{typePrefab.name}_{spawnType}";
 
             group.Add(customer);
             customerList.Add(customer);
@@ -341,15 +372,88 @@ public class CustomerManager : MonoBehaviour
 
             SendGroupToQueue(group);
             groupsSpawnedToday++;
-            Debug.Log($"Группа из {groupSize} чел. отправлена в очередь (всего в очереди: {queuedGroups.Count}).");
+            Debug.Log($"Группа из {groupSize} чел. ({spawnType}) отправлена в очередь (всего в очереди: {queuedGroups.Count}).");
             return;
         }
 
         table.OccupyTable(group);
         groupsSpawnedToday++;
 
-        Debug.Log($"Создана группа из {groupSize} человек. Групп сегодня: {groupsSpawnedToday}/{dailyGroupTarget}. " +
+        Debug.Log($"Создана группа из {groupSize} чел. ({spawnType}). Групп сегодня: {groupsSpawnedToday}/{dailyGroupTarget}. " +
                   $"В зале сейчас: {customerList.Count}/{maxCustomers}.");
+    }
+
+    // ======================================================================
+    // === ТИПЫ КЛИЕНТОВ: выбор типа, размер группы, префаб ===
+    // ======================================================================
+
+    /// <summary>
+    /// Взвешенный бросок типа приходящей группы. Все веса из инспектора (гоблин /
+    /// кобольд / призрак), отрицательные тракруются как ноль; если ВСЕ веса нулевые —
+    /// возвращаем гоблина (базовый тип), чтобы спавн не вставал намертво.
+    /// </summary>
+    private CustomerAI.CustomerType RollCustomerType()
+    {
+        float goblin = Mathf.Max(0f, goblinWeight);
+        float kobold = Mathf.Max(0f, koboldWeight);
+        float ghost = Mathf.Max(0f, ghostWeight);
+
+        float total = goblin + kobold + ghost;
+        if (total <= 0f)
+        {
+            return CustomerAI.CustomerType.Goblin;
+        }
+
+        float roll = UnityEngine.Random.value * total;
+        if (roll < goblin) return CustomerAI.CustomerType.Goblin;
+        if (roll < goblin + kobold) return CustomerAI.CustomerType.Kobold;
+        return CustomerAI.CustomerType.Ghost;
+    }
+
+    /// <summary>
+    /// Размер группы для типа. Ключевые особенности:
+    ///  - Кобольд: НИКОГДА не приходит по одному — минимум двое (даже если
+    ///    maxGroupSize в инспекторе == 1: правило типа сильнее). Нужен стол
+    ///    с 2+ стульями — FindAvailableTable сам отбросит неподходящие столы.
+    ///  - Призрак: всегда приходит один — серия заказов рассчитана на одного
+    ///    едока (3 заказа подряд у одного стула).
+    ///  - Гоблин: обычный диапазон minGroupSize..maxGroupSize из инспектора.
+    /// </summary>
+    private int GetGroupSizeForType(CustomerAI.CustomerType type)
+    {
+        switch (type)
+        {
+            case CustomerAI.CustomerType.Kobold:
+                int koboldMin = Mathf.Max(2, minGroupSize);
+                int koboldMax = Mathf.Max(2, maxGroupSize);
+                return UnityEngine.Random.Range(koboldMin, koboldMax + 1);
+
+            case CustomerAI.CustomerType.Ghost:
+                return 1;
+
+            default:
+                return UnityEngine.Random.Range(minGroupSize, maxGroupSize + 1);
+        }
+    }
+
+    /// <summary>
+    /// Префаб для типа. Отдельные префабы кобольда/призрака назначаются в инспекторе;
+    /// без них типы работают на базовом customerPrefab (визуально неразличимы,
+    /// но поведение — групповой заказ кобольдов и серия призрака — полностью активны).
+    /// </summary>
+    private GameObject GetPrefabForType(CustomerAI.CustomerType type)
+    {
+        switch (type)
+        {
+            case CustomerAI.CustomerType.Kobold:
+                return koboldPrefab != null ? koboldPrefab : customerPrefab;
+
+            case CustomerAI.CustomerType.Ghost:
+                return ghostPrefab != null ? ghostPrefab : customerPrefab;
+
+            default:
+                return customerPrefab;
+        }
     }
 
     /// <summary>

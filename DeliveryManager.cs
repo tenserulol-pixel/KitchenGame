@@ -132,8 +132,12 @@ public class DeliveryManager : MonoBehaviour
             if (plateContentsMatchesRecipe)
             {
                 // Пытаемся передать еду клиентам за этим столом
-                // (клиентский заказ ИЛИ доп. блюдо «Больших порций» — решает DiningTable.TryServe)
-                if (diningTable.TryServe(order.recipeSO))
+                // (клиентский заказ ИЛИ доп. блюдо «Больших порций» — решает DiningTable.TryServe).
+                // servedOnPlate: заказы needsPlate == false (зелья) НЕ оставляют посуды,
+                // даже если их привезли на тарелке — гость пьёт из бутылки, тарелка
+                // возвращается чистой. Правило «безтарельное блюдо — без посуды»
+                // действует для ЛЮБОГО способа подачи (см. также TryDeliverLooseItemToTable).
+                if (diningTable.TryServe(order.recipeSO, servedOnPlate: !order.recipeSO.needsPlate))
                 {
                     waitingOrderList.RemoveAt(i);
 
@@ -167,6 +171,66 @@ public class DeliveryManager : MonoBehaviour
         if (!foundOrderForTable)
         {
             Debug.Log($"[DeliveryManager] У стола '{diningTable.name}' нет активных заказов — подача отклонена.");
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Подача БЕЗ тарелки: предмет в руках игрока и есть блюдо целиком (зелья и т.п.).
+    /// Заказ подходит, только если у его рецепта needsPlate == false и он состоит
+    /// РОВНО из одного ингредиента, совпадающего с предметом в руках.
+    /// Тарелка при этом не нужна и не уничтожается — DestroySelf получает сам предмет.
+    /// Дальнейшая цепочка идентична подаче на тарелке: TryServe → выплата → событие,
+    /// НО поевшие без тарелки не оставляют после себя грязной посуды
+    /// (DiningTable ведёт отдельный учёт таких гостей).
+    /// </summary>
+    public bool TryDeliverLooseItemToTable(KitchenObject kitchenObject, DiningTable diningTable)
+    {
+        if (kitchenObject == null || diningTable == null) return false;
+
+        // Тарелка в руках идёт по обычному пути TryDeliverRecipeToTable — сюда не попадаем
+        if (kitchenObject.TryGetPlate(out _)) return false;
+
+        KitchenObjectSO heldSO = kitchenObject.GetKitchenObjectSo();
+        if (heldSO == null) return false;
+
+        for (int i = 0; i < waitingOrderList.Count; i++)
+        {
+            Order order = waitingOrderList[i];
+            if (order.targetTable != diningTable) continue;
+
+            RecipeSO recipe = order.recipeSO;
+            if (recipe == null) continue;
+
+            // Без тарелки подаётся только рецепт с needsPlate == false и одним
+            // ингредиентом — предмет в руках должен совпадать с этим ингредиентом
+            if (recipe.needsPlate) continue;
+            if (recipe.kitchenObjectSOList == null || recipe.kitchenObjectSOList.Count != 1) continue;
+            if (recipe.kitchenObjectSOList[0] != heldSO) continue;
+
+            if (diningTable.TryServe(recipe, servedOnPlate: false))
+            {
+                waitingOrderList.RemoveAt(i);
+
+                int payout = CalculatePayout(recipe, out string breakdown);
+                if (GameLoopManager.Instance != null)
+                {
+                    GameLoopManager.Instance.AddOrderGold(payout);
+                }
+
+                OnRecipeCompleted?.Invoke(this, EventArgs.Empty);
+
+                kitchenObject.DestroySelf();
+
+                Debug.Log($"[DeliveryManager] УСПЕХ (без тарелки): «{recipe.RecipeName}» → стол '{diningTable.name}'. " +
+                          $"Выплата: {payout} золота ({breakdown}).");
+                return true;
+            }
+            else
+            {
+                Debug.Log($"[DeliveryManager] Совпал заказ «{recipe.RecipeName}» без тарелки, но за столом его некому есть. Предмет остался у игрока.");
+            }
         }
 
         return false;
@@ -450,6 +514,9 @@ public static class RecipeChaos
         mutatedClone.name = victim.name + "_ChaosClone";
         mutatedClone.RecipeName = victim.RecipeName;
         mutatedClone.Cost = victim.Cost;
+        // Флаг «подача без тарелки» (зелья) переносится в клон, иначе мутация
+        // зелья-рецепта сделала бы его подаваемым только на тарелке.
+        mutatedClone.needsPlate = victim.needsPlate;
         mutatedClone.kitchenObjectSOList = new List<KitchenObjectSO>(victim.kitchenObjectSOList);
         mutatedClone.kitchenObjectSOList[mutatedClone.kitchenObjectSOList.IndexOf(removed)] = added;
 

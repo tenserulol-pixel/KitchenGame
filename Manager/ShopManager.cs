@@ -15,6 +15,11 @@ using UnityEngine;
 ///    GridPositioningSystem через свой Awake.
 /// 6) Увеличиваем счётчик покупок этого товара.
 ///
+/// ★ v1.6 (стены вне магазина):
+/// - Товары, чей префаб содержит WallPiece (стены), НЕ продаются: TryBuyItem
+///   отклоняет их до списания золота и спавна. Стены ставятся только в
+///   редакторе Unity (GridSnapEditor), в игре они часть декораций.
+///
 /// ★ v1.1 (модальность и стены):
 /// - Магазин теперь Push'ит GameLoopManager.PushUiInputLock на время жизни:
 ///   Enter больше НЕ может начать день поверх открытого магазина, а клавиши
@@ -299,6 +304,17 @@ public class ShopManager : MonoBehaviour
         if (item == null)
         {
             Debug.LogWarning("[ShopManager] Попытка купить null товар.");
+            return false;
+        }
+
+        // ★ v1.6: стены не продаются и не ставятся игроком — их расстановка
+        // происходит только в редакторе Unity (GridSnapEditor). Товар-стена,
+        // если он остался в каталоге, отклоняется ДО любых проверок золота
+        // и спавна; в витрине он также скрыт (ShopUI v1.1).
+        if (item.prefab != null && item.prefab.GetComponentInChildren<WallPiece>(true) != null)
+        {
+            Debug.Log($"[ShopManager] '{item.displayName}' — стены не продаются " +
+                      "(расстановка стен — только в редакторе Unity).");
             return false;
         }
 

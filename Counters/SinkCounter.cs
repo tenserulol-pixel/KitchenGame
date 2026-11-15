@@ -152,6 +152,32 @@ public class SinkCounter : BaseCounter, IHasProgress
     }
 
     /// <summary>
+    /// ★ Конец дня: посуда не переживает смену. Грязная тарелка на раковине
+    /// исчезает, прогресс мойки и индикатор «моют» сбрасываются. Чистая тарелка
+    /// (уже вымытая, но не забранная) остаётся на месте — это обычный предмет.
+    /// Вызывается из GameLoopManager.FinishActiveDay (ResetDishesForNewDay).
+    /// </summary>
+    public void ResetForNewDay()
+    {
+        bool wasWashing = isWashing;
+        isWashing = false;
+        washProgress = 0f;
+
+        if (HasKitchenObject()
+            && GetKitchenObject().GetKitchenObjectSo() == dirtyPlateKitchenObjectSO)
+        {
+            GetKitchenObject().DestroySelf();
+        }
+
+        if (wasWashing)
+        {
+            OnWashingChanged?.Invoke(this, new OnWashingChangedEventArgs { isWashing = false });
+        }
+
+        OnProgressChanged?.Invoke(this, new IHasProgress.OnProgressChangedEventArgs { progressNormalized = 0f });
+    }
+
+    /// <summary>
     /// ★ Магазинный апгрейд «Очищенная вода» (ShopManager → UpgradeEffect.PurifyingWater).
     /// Идемпотентен: повторный вызов (восстановление сохранения) ничего не ломает.
     /// </summary>
