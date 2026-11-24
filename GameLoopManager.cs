@@ -374,19 +374,21 @@ public class GameLoopManager : MonoBehaviour
         }
 
         // 2) Стопки чистой посуды
-        foreach (PlatesCounter platesCounter in FindObjectsOfType<PlatesCounter>())
+        // ★ FindObjectsByType вместо устаревшего FindObjectsOfType (warning CS0618):
+        // порядок обхода не важен, поэтому FindObjectsSortMode.None — самый быстрый вариант.
+        foreach (PlatesCounter platesCounter in FindObjectsByType<PlatesCounter>(FindObjectsSortMode.None))
         {
             platesCounter.RefillForNewDay();
         }
 
         // 3) Раковины: грязная тарелка исчезает, мойка сбрасывается
-        foreach (SinkCounter sinkCounter in FindObjectsOfType<SinkCounter>())
+        foreach (SinkCounter sinkCounter in FindObjectsByType<SinkCounter>(FindObjectsSortMode.None))
         {
             sinkCounter.ResetForNewDay();
         }
 
         // 4) Грязные тарелки где угодно ещё (руки игрока, ClearCounter, и т.д.)
-        foreach (KitchenObject kitchenObject in FindObjectsOfType<KitchenObject>())
+        foreach (KitchenObject kitchenObject in FindObjectsByType<KitchenObject>(FindObjectsSortMode.None))
         {
             if (kitchenObject != null && SinkCounter.IsDirtyPlateSO(kitchenObject.GetKitchenObjectSo()))
             {

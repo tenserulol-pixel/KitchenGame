@@ -1,5 +1,6 @@
 using UnityEngine;
 using UnityEngine.AI;
+using System.Collections.Generic;
 
 /// <summary>
 /// Гибрид «агент рулит — физика исполняет» (вариант 1 миграции на обычную физику).
@@ -17,13 +18,17 @@ using UnityEngine.AI;
 /// - гость-гость: честные столкновения капсул + RVO обход по маршруту;
 /// - гость-стены/мебель: тело физически не пролезает сквозь геометрию;
 /// - гость-дверь: динамическое полотно и гость толкаются по массам;
-/// - игрок (двигается через transform) для PhysX — «бесконечно тяжёлый»:
-///   проходя сквозь толпу, он РАЗДВИГАЕТ гостей; BodyPusher дополнительно
-///   может швырять гостей импульсом (слой Customer в Pushable Layers);
-/// - гость → игрок: как и раньше, кастомный код ОТТЕСНЯЕТ игрока
-///   (перенесён из CustomerCollision без изменения логики). Поэтому в
-///   матрице коллизий пара Customer × Player должна быть ВЫКЛЮЧЕНА —
-///   иначе PhysX и этот код будут драться за одну пару капсул.
+/// - игрок (двигается через transform) проходит СКВОЗЬ толпу: контакт гостя
+///   с героем всегда МЯГКИЙ — гость ПИХАЕТ героя ограниченным толчком
+///   (доля проникновения за физ-шаг уходит в Player.AddCrowdPush), а сам
+///   слегка уступает плечом. Герой ощущает толкучку: его сдвигает и чуть
+///   замедляет (Player.cs), но жёсткой коллизии и рывков нет;
+/// - BodyPusher (на игроке) больше не швыряет гостей импульсом — гости
+///   исключены из толкаемых целей на уровне кода (двери/ящики работают как раньше);
+/// - гость → гость: PhysX + RVO, как раньше, плюс двухуровневое анти-залипание:
+///   манёвр обхода дугой с эскалацией (сторона/угол/длительность растут от попытки
+///   к попытке), а после нескольких неудач — АВАРИЙНЫЙ ПРОРЫВ: на rescueSeconds
+///   коллизии с другими гостями отключаются и гость проходит «сквозь» толкучку.
 ///
 /// СОСТОЯНИЯ:
 /// - Активные (Walking / WalkingToQueue / Queueing / Leaving): тело
@@ -37,16 +42,24 @@ using UnityEngine.AI;
 /// посадка) в CustomerAI идут через WarpTo() — при updatePosition=false
 /// без Warp агент повёл бы гостя со старого места.
 ///
-/// ★ АНТИ-ЗАЛИПАНИЕ (обход толкучки): RVO-руление и физика разводят гостей
-/// не идеально — во встречных потоках и узких местах два гостя могут ДОЛГО
-/// толкаться друг с другом без прогресса. Если контакт с другим гостем
-/// держится дольше guestJamSeconds при живом курсе (путь есть, до цели
-/// не дошёл) и без горизонтального хода — включается манёвр обхода: на
-/// sidestepSeconds желаемая скорость тела ведётся дугой (sidestepAngle)
-/// в сторону ОТ мешающего гостя, и гость физически огибает его. Контакт
-/// ушёл и ход набрался — манёвр гасится досрочно, гость возвращается на
-/// курс. Встречные пары расходятся симметрично (оба берут «влево»),
-/// явная сторона дуги — по позиции конкретного блокера.
+/// ★ АНТИ-ЗАЛИПАНИЕ (обход толкучки) — три уровня эскалации:
+/// 1) RVO-руление и PhysX сами стараются развести гостей;
+/// 2) толкучка (контакт с другим гостем ИЛИ с игроком дольше guestJamSeconds
+///    при живом курсе и без горизонтального хода) → манёвр обхода дугой:
+///    на sidestepSeconds скорость ведётся в сторону ОТ блокера (лобовые
+///    пары — по правилу «уходи влево»: встречные гости гарантированно берут
+///    разные стороны и расходятся, а не грызутся на одной дуге). Попытка не
+///    удалась — повтор с эскалацией: сторона меняется (при неопознанном
+///    блокере — поочерёдно), угол растёт на sidestepAngleStepPerAttempt,
+///    длительность — на sidestepExtraSecondsPerAttempt;
+/// 3) после maxSidestepAttemptsBeforeRescue неудачных манёвров — аварийный
+///    ПРОРЫВ (StartRescue): на rescueSeconds PhysX-коллизии этого гостя с
+///    другими гостями отключаются (пара восстанавливается по таймеру после
+///    выхода из толкучки), а тело идёт по пути НАПРЯМУЮ «сквозь» толкучку.
+///    Игрок тоже не «прилипает» к гостю: он учитывается как блокер в том же
+///    манёвре, а во время прорыва гость проходит мимо без толчков (пара
+///    гость × игрок всегда мягкая — матрица коллизий выключена, пихание
+///    делает скрипт, а не PhysX).
 /// </summary>
 [RequireComponent(typeof(NavMeshAgent))]
 [RequireComponent(typeof(CapsuleCollider))]
@@ -89,16 +102,35 @@ public class CustomerPhysicsAgent : MonoBehaviour
     [SerializeField] private float sidestepRepeatPause = 0.6f;
     [Tooltip("Сдвиг за физ-кадр (м), ниже которого гость считается не движущимся")]
     [SerializeField] private float sidestepProgressThreshold = 0.004f;
+    [Tooltip("Сколько попыток дуги разрешено до аварийного прорыва")]
+    [SerializeField, Range(1, 5)] private int maxSidestepAttemptsBeforeRescue = 2;
+    [Tooltip("На сколько градусов растёт дуга обхода с каждой неудачной попыткой (градусы)")]
+    [SerializeField] private float sidestepAngleStepPerAttempt = 15f;
+    [Tooltip("На сколько секунд удлиняется дуга с каждой неудачной попыткой (сек)")]
+    [SerializeField] private float sidestepExtraSecondsPerAttempt = 0.25f;
 
-    [Header("Толкание игрока (перенесено из CustomerCollision)")]
-    [Tooltip("Доля разводящего сдвига, которая уходит ИГРОКУ (0..1). Остаток гость " +
-             "гасит собственным отшатом. 1 — гость выталкивает только игрока, " +
-             "0.7 — игрок отступает, гость слегка пружинит")]
-    [SerializeField, Range(0f, 1f)] private float playerPushShare = 0.7f;
-    [Tooltip("Максимальный сдвиг ИГРОКА за один физический шаг (м). Ограничивает " +
-             "скорость, с которой гость способен оттеснить героя")]
-    [SerializeField] private float maxPlayerPushPerStep = 0.05f;
-    [Tooltip("Запас к сумме радиусов при поиске контакта с игроком. На силу толкания " +
+    [Header("Аварийный прорыв (последний уровень анти-залипания)")]
+    [Tooltip("Сколько секунд гость проходит «сквозь» толкучку с отключёнными " +
+             "коллизиями с другими гостями (сек)")]
+    [SerializeField] private float rescueSeconds = 1.2f;
+    [Tooltip("Пауза после прорыва, прежде чем снова возможен манёвр/прорыв (сек)")]
+    [SerializeField] private float rescueCooldownSeconds = 3f;
+
+    [Header("Мягкая толпа: гость пихает игрока")]
+    [Tooltip("Какую долю глубины проникновения гость передаёт ИГРОКУ мягким толчком (0..1). " +
+             "Игрок ощущает толкучку (его сдвигает), но жёсткой коллизии нет — герой " +
+             "по-прежнему проходит сквозь толпу свободно")]
+    [SerializeField, Range(0f, 1f)] private float playerPushShare = 0.5f;
+    [Tooltip("Максимальный сдвиг ИГРОКА за один физический шаг (м) — потолок скорости, " +
+             "с которой гость способен отодвигать героя. 0.035 ≈ 1.75 м/с при 50 Гц физики")]
+    [SerializeField] private float maxPlayerPushPerStep = 0.035f;
+    [Tooltip("Какую долю глубины проникновения гость гасит собственным сдвигом в сторону (0..1). " +
+             "«Поворачивается плечом» — вместе с толчком делает контакт мягким для обеих сторон")]
+    [SerializeField, Range(0f, 1f)] private float guestYieldShare = 0.45f;
+    [Tooltip("Максимальный сдвиг СОБСТВЕННОГО тела гостя за один физический шаг (м). " +
+             "Ограничивает скорость, с которой гость способен отступить в сторону от героя")]
+    [SerializeField] private float maxGuestYieldPerStep = 0.04f;
+    [Tooltip("Запас к сумме радиусов при поиске контакта с игроком. На силу уступки " +
              "не влияет — только на стабильность детекта контакта")]
     [SerializeField] private float playerScanMargin = 0.25f;
 
@@ -122,10 +154,10 @@ public class CustomerPhysicsAgent : MonoBehaviour
     // Сколько времени тело гостя находится вне NavMesh подряд.
     private float offMeshTimer;
 
-    // ★ Анти-залипание: контакт с другим гостем из скана ApplyPlayerPush
-    // (перечитывается каждый физ-кадр) и состояние манёвра обхода.
-    private bool hadGuestContact;
-    private Vector3 lastGuestContactPosition;
+    // ★ Анти-залипание: контакт толпы (другой гость ИЛИ игрок) из скана
+    // ScanCrowdContacts (перечитывается каждый физ-кадр) и состояние манёвра.
+    private bool hadCrowdContact;
+    private Vector3 lastBlockerPosition;
     private float guestContactDistance;
     private float guestJamTimer;
     private float sidestepTimer;
@@ -133,12 +165,25 @@ public class CustomerPhysicsAgent : MonoBehaviour
     private float sidestepSide;
     private Vector3 sidestepBaseDirection;
     private float sidestepSpeed;
+
+    // ★ Эскалация и аварийный прорыв.
+    // Сколько попыток дуги подряд не удались (сбрасывается при успехе).
+    private int sidestepAttemptCount;
+    // Остаток времени прорыва (>0 — тело идёт по пути «сквозь» толкучку).
+    private float rescueTimer;
+    // Пауза после прорыва, прежде чем снова возможен манёвр/прорыв.
+    private float rescueCooldownTimer;
+    private Vector3 rescueDirection;
+    private float rescueSpeed;
+    // Коллайдеры гостей с отключёнными на время прорыва коллизиями и моменты
+    // (Time.time), когда пару можно восстановить (с запасом после выхода из толкучки).
+    private readonly List<Collider> rescuedIgnoreColliders = new List<Collider>();
+    private readonly List<float> rescuedIgnoreRestoreTimes = new List<float>();
     private Vector3 lastBodyPosition;
     private bool lastBodyPositionValid;
 
     // Переиспользуемые буферы — ноль аллокаций в физ-кадре.
     private static readonly Collider[] overlapBuffer = new Collider[32];
-    private static readonly RaycastHit[] castBuffer = new RaycastHit[8];
 
     private void Awake()
     {
@@ -183,6 +228,13 @@ public class CustomerPhysicsAgent : MonoBehaviour
                       $"Y {(freezeYPosition ? "заморожен" : "свободен")}).");
         }
     }
+
+    /// <summary>
+    /// True, пока гость сидит за столом (тело кинематическое — твёрдое для игрока).
+    /// Player.cs использует это: сидящие гости остаются твёрдыми препятствиями,
+    /// идущие — «мягкие», герой проходит сквозь них с лёгким замедлением.
+    /// </summary>
+    public bool IsSeated => seated;
 
     /// <summary>
     /// Переключает тело гостя «сидит/встал». Вызывается из CustomerAI:
@@ -295,16 +347,16 @@ public class CustomerPhysicsAgent : MonoBehaviour
                            agent.isOnNavMesh &&
                            !body.isKinematic;
 
-        // === Скан контактов: игрок (оттеснение) и другие гости (анти-залипание) ===
-        // Выполняется ДО расчёта скорости: пометка контакта с гостем нужна
+        // === Скан контактов: игрок (мягкая уступка) и другие гости (анти-залипание) ===
+        // Выполняется ДО расчёта скорости: пометка контакта толпы нужна
         // манёвру обхода в этом же физ-кадре.
         if (agentDrives && IsGuestActiveState() && IsInteractionWindow())
         {
-            ApplyPlayerPush();
+            ScanCrowdContacts();
         }
         else
         {
-            hadGuestContact = false;
+            hadCrowdContact = false;
         }
 
         // === Скорость: плавно тянем тело к желаемой скорости агента ===
@@ -319,10 +371,17 @@ public class CustomerPhysicsAgent : MonoBehaviour
             Vector3 desired = agent.desiredVelocity;
             target = new Vector3(desired.x, current.y, desired.z);
 
+            // ★ Аварийный прорыв: на rescueSeconds тело идёт по пути НАПРЯМУЮ
+            // «сквозь» толкучку — PhysX его не удерживает (пара гость-гость отключена).
+            if (rescueTimer > 0f && rescueDirection.sqrMagnitude > 0.001f)
+            {
+                Vector3 rescue = rescueDirection * rescueSpeed;
+                target = new Vector3(rescue.x, current.y, rescue.z);
+            }
             // ★ Манёвр обхода: пока он активен, скорость тела ведётся по дуге
             // вокруг мешающего гостя (в сторону от него) — даже если RVO-руление
             // в затыке заглушило desiredVelocity: гость физически огибает препятствие.
-            if (sidestepTimer > 0f && sidestepBaseDirection.sqrMagnitude > 0.001f)
+            else if (sidestepTimer > 0f && sidestepBaseDirection.sqrMagnitude > 0.001f)
             {
                 Vector3 arced = Quaternion.Euler(0f, sidestepAngle * sidestepSide, 0f) *
                                 (sidestepBaseDirection * sidestepSpeed);
@@ -346,8 +405,9 @@ public class CustomerPhysicsAgent : MonoBehaviour
             agent.nextPosition = body.position;
         }
 
-        // === Анти-залипание: длительная толкучка с гостем → манёвр обхода ===
+        // === Анти-залипание: толкучка → манёвр обхода, неудачные попытки → прорыв ===
         UpdateSidestepManeuver(agentDrives);
+        UpdateRescueTimers();
 
         // === Страховка NavMesh: вытолкнутого с сетки гостя возвращаем назад ===
         // Толчок игрока/двери может занести тело в carve-дыру стола или двери,
@@ -416,13 +476,13 @@ public class CustomerPhysicsAgent : MonoBehaviour
 
     /// <summary>
     /// Один OverlapSphere на физ-кадр. Гостя-гостя по-прежнему разводит PhysX;
-    /// здесь остаётся оттеснение игрока — и, с анти-залипанием, ЗАМЕТКА
-    /// контакта с другим гостем для манёвра обхода (hadGuestContact).
+    /// здесь: мягкое пихание гостем игрока (ResolvePlayerContact) и ЗАМЕТКА
+    /// контакта толпы (другой гость ИЛИ игрок) для манёвра обхода (hadCrowdContact).
     /// </summary>
-    private void ApplyPlayerPush()
+    private void ScanCrowdContacts()
     {
-        hadGuestContact = false;
-        lastGuestContactPosition = Vector3.zero;
+        hadCrowdContact = false;
+        lastBlockerPosition = Vector3.zero;
 
         float scanRadius = GetPlayerScanRadius();
 
@@ -436,7 +496,13 @@ public class CustomerPhysicsAgent : MonoBehaviour
             ~0,
             QueryTriggerInteraction.Ignore);
 
-        for (int i = 0; i < hits; i++)
+        // ★ Кламп: NonAlloc возвращает ОБЩЕЕ число попаданий, которое может
+        // ПРЕВЫСИТЬ длину буфера — без клампа цикл падает
+        // IndexOutOfRangeException каждый физ-шаг (та же причина, по которой
+        // замирал игрок: см. Player.CapsuleBlocked).
+        int resultCount = Mathf.Min(hits, overlapBuffer.Length);
+
+        for (int i = 0; i < resultCount; i++)
         {
             Collider col = overlapBuffer[i];
 
@@ -455,7 +521,8 @@ public class CustomerPhysicsAgent : MonoBehaviour
 
             if (player != null)
             {
-                // Гость игрока НЕ уступает: в контакте он ОТТЕСНЯЕТ героя.
+                // Гость мягко пихает героя: ограниченный толчок игроку + своя
+                // лёгкая уступка плечом (детали в ResolvePlayerContact).
                 ResolvePlayerContact(player, col);
             }
 
@@ -470,11 +537,11 @@ public class CustomerPhysicsAgent : MonoBehaviour
 
                 if (toGuest.magnitude <= guestContactDistance)
                 {
-                    hadGuestContact = true;
+                    hadCrowdContact = true;
 
-                    if (lastGuestContactPosition.sqrMagnitude < 0.0001f)
+                    if (lastBlockerPosition.sqrMagnitude < 0.0001f)
                     {
-                        lastGuestContactPosition = otherGuest.transform.position;
+                        lastBlockerPosition = otherGuest.transform.position;
                     }
                 }
             }
@@ -484,11 +551,12 @@ public class CustomerPhysicsAgent : MonoBehaviour
     }
 
     /// <summary>
-    /// ★ Анти-залипание: накопление «толкучки» и запуск/гашение манёвра обхода.
-    /// Толкучка = контакт с другим гостем при живом курсе (путь есть, до цели
-    /// не дошёл) и без горизонтального прогресса. Манёвр: на sidestepSeconds
-    /// желаемая скорость идёт дугой от мешающего гостя; контакт ушёл и ход
-    /// набрался — гасим досрочно, гость возвращается на курс.
+    /// ★ Анти-залипание: накопление «толкучки» и запуск/гашение манёвра обхода,
+    /// плюс эскалация попыток и вызов аварийного прорыва. Толкучка = контакт с
+    /// другим гостем ИЛИ игроком при живом курсе (путь есть, до цели не дошёл)
+    /// и без горизонтального прогресса. Манёвр: на sidestepSeconds (+ эскалация)
+    /// желаемая скорость идёт дугой от блокера; контакт ушёл и ход набрался —
+    /// гасим досрочно. Несколько неудачных попыток подряд — StartRescue.
     /// </summary>
     private void UpdateSidestepManeuver(bool agentDrives)
     {
@@ -498,8 +566,19 @@ public class CustomerPhysicsAgent : MonoBehaviour
         {
             guestJamTimer = 0f;
             sidestepTimer = 0f;
+            sidestepAttemptCount = 0;
             lastBodyPosition = body != null ? body.position : transform.position;
             lastBodyPositionValid = body != null;
+            return;
+        }
+
+        if (rescueTimer > 0f)
+        {
+            // Во время прорыва толкучка не копится: тело идёт по пути напрямую.
+            guestJamTimer = 0f;
+            sidestepTimer = 0f;
+            lastBodyPosition = body.position;
+            lastBodyPositionValid = true;
             return;
         }
 
@@ -515,9 +594,9 @@ public class CustomerPhysicsAgent : MonoBehaviour
         bool progressed = lastBodyPositionValid &&
                           frameDelta.magnitude > sidestepProgressThreshold;
 
-        if (hadGuestContact && tryingToGo && !progressed)
+        if (hadCrowdContact && tryingToGo && !progressed)
         {
-            // Толкается с гостем, курс жив, а места не набирает — копим таймер.
+            // Толкается с гостем/игроком, курс жив, а места не набирает — копим таймер.
             guestJamTimer += Time.fixedDeltaTime;
         }
         else
@@ -531,19 +610,50 @@ public class CustomerPhysicsAgent : MonoBehaviour
             sidestepCooldownTimer -= Time.fixedDeltaTime;
         }
 
+        if (rescueCooldownTimer > 0f)
+        {
+            rescueCooldownTimer -= Time.fixedDeltaTime;
+        }
+
         if (sidestepTimer > 0f)
         {
             sidestepTimer -= Time.fixedDeltaTime;
 
-            // Досрочный выход: контакт ушёл и гость снова набирает ход.
-            if (!hadGuestContact && progressed)
+            // Досрочный выход: контакт ушёл и гость снова набирает ход — манёвр
+            // удался, счётчик эскалации обнуляется.
+            if (!hadCrowdContact && progressed)
             {
                 sidestepTimer = 0f;
+                sidestepAttemptCount = 0;
+            }
+            else if (sidestepTimer <= 0f)
+            {
+                // Попытка истекла без успеха: если толкучка осталась — эскалация:
+                // повтор дуги с большим углом/длительностью, после нескольких
+                // неудач подряд — аварийный прорыв.
+                sidestepTimer = 0f;
+
+                if (tryingToGo && hadCrowdContact && rescueCooldownTimer <= 0f)
+                {
+                    if (sidestepAttemptCount >= maxSidestepAttemptsBeforeRescue)
+                    {
+                        StartRescue();
+                    }
+                    else
+                    {
+                        StartSidestep();
+                    }
+                }
+                else
+                {
+                    sidestepAttemptCount = 0;
+                }
             }
         }
         else if (tryingToGo &&
                  guestJamTimer >= guestJamSeconds &&
-                 sidestepCooldownTimer <= 0f)
+                 sidestepCooldownTimer <= 0f &&
+                 rescueCooldownTimer <= 0f)
         {
             StartSidestep();
         }
@@ -553,15 +663,26 @@ public class CustomerPhysicsAgent : MonoBehaviour
     }
 
     /// <summary>
-    /// ★ Запуск манёвра обхода: фиксируем курс на момент старта (желаемая
-    /// скорость, иначе конечная точка пути, иначе взгляд), скорость и сторону
-    /// дуги — от мешающего гостя. Встречные пары при неопределённой стороне
-    /// расходятся симметрично: оба берут «влево» и разъезжаются.
+    /// ★ Запуск манёвра обхода с эскалацией: фиксируем курс на момент старта
+    /// (желаемая скорость, иначе конечная точка пути, иначе взгляд), скорость
+    /// и сторону дуги — от блокера (гость или игрок). Блокер не опознан —
+    /// сторона чередуется от попытки к попытке; лобовой контакт (блокер почти
+    /// точно по курсу) — правило «уходи влево», чтобы встречная пара гостей
+    /// гарантированно взяла РАЗНЫЕ стороны и разошлась борт к борту, а не
+    /// грызлась на одной дуге. Каждая неудачная попытка делает дугу круче и
+    /// длиннее (sidestepAngleStepPerAttempt, sidestepExtraSecondsPerAttempt) —
+    /// гость обходит толкучку всё решительнее.
     /// </summary>
     private void StartSidestep()
     {
-        sidestepTimer = sidestepSeconds;
-        sidestepCooldownTimer = sidestepSeconds + sidestepRepeatPause;
+        int attempt = sidestepAttemptCount; // 0 для первой попытки
+        sidestepAttemptCount++;
+
+        float angle = Mathf.Min(sidestepAngle + attempt * sidestepAngleStepPerAttempt, 120f);
+        float duration = sidestepSeconds + attempt * sidestepExtraSecondsPerAttempt;
+
+        sidestepTimer = duration;
+        sidestepCooldownTimer = duration + sidestepRepeatPause;
         guestJamTimer = 0f;
 
         Vector3 course = agent != null ? agent.desiredVelocity : Vector3.zero;
@@ -583,15 +704,16 @@ public class CustomerPhysicsAgent : MonoBehaviour
         sidestepBaseDirection = course.normalized;
         sidestepSpeed = agent != null && agent.speed > 0.05f ? agent.speed : 1.5f;
 
-        Vector3 toBlocker = lastGuestContactPosition - transform.position;
+        Vector3 toBlocker = lastBlockerPosition - transform.position;
         toBlocker.y = 0f;
 
         if (toBlocker.sqrMagnitude < 0.0001f)
         {
-            // Блокер не опознан (контакт по буферу скана) — дуга «влево»:
-            // встречный гость с тем же правилом возьмёт СВОЁ «влево» —
-            // разъедутся в противоположные стороны мира.
-            sidestepSide = -1f;
+            // Блокер не опознан (контакт по буферу скана) — чередуем сторону дуги
+            // от попытки к попытке: повторный неопознанный затык не бьётся
+            // в ту же стену, а встречная пара с опознанными блокерами всё
+            // равно разъедется по правилу «влево» ниже.
+            sidestepSide = attempt % 2 == 0 ? -1f : 1f;
         }
         else
         {
@@ -599,81 +721,274 @@ public class CustomerPhysicsAgent : MonoBehaviour
             float cross = sidestepBaseDirection.x * toBlocker.z -
                           sidestepBaseDirection.z * toBlocker.x;
 
-            sidestepSide = cross > 0f ? 1f : -1f;
+            if (Mathf.Abs(cross) < toBlocker.magnitude * 0.15f)
+            {
+                // ★ ЛОБОВАЯ ВСТРЕЧА (блокер почти точно по курсу, |cross| —
+                // численный шум): раньше оба гостя пары могли выбрать ОДНУ
+                // сторону и продолжали грызться лбами. Правило «уходи влево»:
+                // каждый сворачивает в СВОЮ левую сторону — у встречных это
+                // противоположные стороны мира, пара расходится борт к борту
+                // (как пешеходы на тротуаре).
+                sidestepSide = -1f;
+            }
+            else
+            {
+                sidestepSide = cross > 0f ? 1f : -1f;
+            }
         }
 
         if (debugLogs)
         {
-            Debug.Log($"[CustomerPhysicsAgent] '{name}': долго толкается с другим гостем — " +
-                      $"обход дугой {(sidestepSide > 0f ? "вправо" : "влево")} " +
-                      $"({sidestepAngle}°, {sidestepSeconds} с).", this);
+            Debug.Log($"[CustomerPhysicsAgent] '{name}': толкучка — обход дугой " +
+                      $"{(sidestepSide > 0f ? "вправо" : "влево")} ({angle:F0}°, " +
+                      $"{duration:F1} с, попытка {sidestepAttemptCount}).", this);
         }
     }
 
     /// <summary>
-    /// Контакт гостя с игроком: гость оттесняет героя на свою долю
-    /// (playerPushShare), неразрешённый остаток гасит отшатом.
-    /// Итог: свободного игрока гость толкает перед собой, зажатого
-    /// стеной — давит на месте, сквозь не проходит.
-    /// Логика перенесена из CustomerCollision.ResolvePlayerContact без изменений.
+    /// ★ Аварийный прорыв — последний уровень анти-залипания. После
+    /// maxSidestepAttemptsBeforeRescue неудачных дуг: на rescueSeconds гость идёт
+    /// по пути НАПРЯМУЮ: PhysX-коллизии с другими гостями отключаются (они сейчас
+    /// касаются — иначе тела просто снова упираются друг в друга), и тело проходит
+    /// толкучку «сквозь». Пары восстанавливаются по таймеру с запасом +0.3 с
+    /// после конца прорыва — к этому моменту гости уже разошлись, а остаточное
+    /// проникновение мягко разбирает Depenetration (maxDepenetrationVelocity).
+    /// Гарантирует: никакая толкучка не длится вечно.
+    /// </summary>
+    private void StartRescue()
+    {
+        rescueTimer = rescueSeconds;
+        rescueCooldownTimer = rescueSeconds + rescueCooldownSeconds;
+        guestJamTimer = 0f;
+        sidestepTimer = 0f;
+        sidestepAttemptCount = 0;
+
+        Vector3 course = agent != null ? agent.desiredVelocity : Vector3.zero;
+        course.y = 0f;
+
+        if (course.sqrMagnitude < 0.0001f && agent != null && agent.hasPath &&
+            agent.path != null && agent.path.corners.Length >= 2)
+        {
+            course = agent.path.corners[agent.path.corners.Length - 1] - transform.position;
+            course.y = 0f;
+        }
+
+        if (course.sqrMagnitude < 0.0001f)
+        {
+            course = transform.forward;
+            course.y = 0f;
+        }
+
+        rescueDirection = course.normalized;
+        rescueSpeed = agent != null && agent.speed > 0.05f ? agent.speed * 1.25f : 2f;
+
+        // Отключаем пару гость-гость со всеми, кто касается прямо сейчас.
+        int hits = Physics.OverlapSphereNonAlloc(
+            transform.position + Vector3.up * 1f,
+            guestContactDistance + 0.3f,
+            overlapBuffer,
+            ~0,
+            QueryTriggerInteraction.Ignore);
+
+        // ★ Кламп буфера — детали в комментарии к циклу выше.
+        int resultCount = Mathf.Min(hits, overlapBuffer.Length);
+
+        for (int i = 0; i < resultCount; i++)
+        {
+            Collider col = overlapBuffer[i];
+
+            if (col == null || col == selfCollider)
+            {
+                continue;
+            }
+
+            CustomerAI other = col.GetComponentInParent<CustomerAI>();
+
+            if (other == null || other == self)
+            {
+                continue;
+            }
+
+            if (rescuedIgnoreColliders.Contains(col))
+            {
+                continue;
+            }
+
+            if (selfCollider != null)
+            {
+                Physics.IgnoreCollision(selfCollider, col, true);
+                rescuedIgnoreColliders.Add(col);
+                rescuedIgnoreRestoreTimes.Add(Time.time + rescueSeconds + 0.3f);
+            }
+        }
+
+        if (debugLogs)
+        {
+            Debug.Log($"[CustomerPhysicsAgent] '{name}': дуги не помогли — аварийный " +
+                      $"прорыв сквозь толкучку ({rescueSeconds:F1} с).", this);
+        }
+    }
+
+    /// <summary>
+    /// Выполняется каждый физ-кадр: гашение таймера прорыва и восстановление
+    /// отключённых пар гость-гость по их таймерам (даже после конца прорыва).
+    /// </summary>
+    private void UpdateRescueTimers()
+    {
+        if (rescueTimer > 0f)
+        {
+            rescueTimer -= Time.fixedDeltaTime;
+
+            if (rescueTimer <= 0f)
+            {
+                rescueTimer = 0f;
+
+                if (debugLogs)
+                {
+                    Debug.Log($"[CustomerPhysicsAgent] '{name}': прорыв завершён — " +
+                              "пары коллизий будут восстановлены.", this);
+                }
+            }
+        }
+
+        for (int i = rescuedIgnoreColliders.Count - 1; i >= 0; i--)
+        {
+            Collider other = rescuedIgnoreColliders[i];
+
+            if (other == null)
+            {
+                // Гость уничтожен (конец дня, выход в меню) — просто забываем пару.
+                rescuedIgnoreColliders.RemoveAt(i);
+                rescuedIgnoreRestoreTimes.RemoveAt(i);
+                continue;
+            }
+
+            if (Time.time >= rescuedIgnoreRestoreTimes[i] && selfCollider != null)
+            {
+                Physics.IgnoreCollision(selfCollider, other, false);
+                rescuedIgnoreColliders.RemoveAt(i);
+                rescuedIgnoreRestoreTimes.RemoveAt(i);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Полное восстановление отключённых пар (уничтожение гостя, выгрузка сцены).
+    /// </summary>
+    private void RestoreIgnoredColliders()
+    {
+        if (selfCollider != null)
+        {
+            for (int i = 0; i < rescuedIgnoreColliders.Count; i++)
+            {
+                Collider other = rescuedIgnoreColliders[i];
+
+                if (other != null)
+                {
+                    Physics.IgnoreCollision(selfCollider, other, false);
+                }
+            }
+        }
+
+        rescuedIgnoreColliders.Clear();
+        rescuedIgnoreRestoreTimes.Clear();
+    }
+
+    // ★ Если гость уничтожается во время прорыва (конец дня, выход в меню),
+    // отключённые пары не должны остаться «проигноренными» навсегда.
+    private void OnDestroy()
+    {
+        RestoreIgnoredColliders();
+    }
+
+    /// <summary>
+    /// ★ Контакт гостя с игроком — МЯГКОЕ ПИХАНИЕ вместо жёсткой коллизии:
+    /// гость передаёт герою часть глубины проникновения ограниченным толчком
+    /// (playerPushShare, потолок maxPlayerPushPerStep → Player.AddCrowdPush),
+    /// а сам слегка «поворачивается плечом» — гасит остаток собственным
+    /// сдвигом в сторону (guestYieldShare, maxGuestYieldPerStep). Толпа
+    /// ощущается: героя сдвигает и замедляет (Player.cs), но рывков нет и
+    /// сквозь толпу он проходит свободно. Игрок попутно считается источником
+    /// затыка: манёвр обхода срабатывает на него так же, как на другого гостя
+    /// (застрявший НА игроке гость обойдёт его). Во время аварийного прорыва
+    /// толчки отключены — гость проходит мимо молча.
     /// </summary>
     private void ResolvePlayerContact(Player player, Collider playerCol)
     {
         WarnIfPlayerHasObstacle(player);
 
+        // Во время прорыва гость проходит «сквозь» всё — ни толчков, ни заметок.
+        if (rescueTimer > 0f)
+        {
+            return;
+        }
+
         float playerRadius = GetPlayerRadius(player, playerCol);
         float contactDistance = playerRadius + agent.radius;
 
-        Vector3 away = transform.position - player.transform.position;
-        away.y = 0f;
+        Vector3 toPlayer = player.transform.position - transform.position;
+        toPlayer.y = 0f;
 
-        float distance = away.magnitude;
+        float distance = toPlayer.magnitude;
         float overlap = contactDistance - distance;
 
-        // Контакта нет — гость свободно подходит вплотную, никакой
-        // заблаговременной уступки нет.
+        // Контакта нет — гость свободно подходит вплотную, никакого
+        // заблаговременного толчка нет.
         if (overlap <= 0f)
         {
             return;
         }
 
+        // Игрок — тоже источник затыка: манёвр обхода работает на него.
+        hadCrowdContact = true;
+
+        if (lastBlockerPosition.sqrMagnitude < 0.0001f)
+        {
+            lastBlockerPosition = player.transform.position;
+        }
+
+        Vector3 pushDirection;
+
         // Полное совпадение центров — толкаем в случайную сторону.
         if (distance < 0.0001f)
         {
-            away = new Vector3(Random.Range(-1f, 1f), 0f, Random.Range(-1f, 1f));
+            pushDirection = new Vector3(Random.Range(-1f, 1f), 0f, Random.Range(-1f, 1f));
 
-            if (away.sqrMagnitude < 0.0001f)
+            if (pushDirection.sqrMagnitude < 0.0001f)
             {
-                away = Vector3.forward;
+                pushDirection = Vector3.forward;
             }
 
-            away.Normalize();
+            pushDirection.Normalize();
         }
         else
         {
-            away.Normalize();
+            pushDirection = toPlayer / distance;
         }
 
-        // Доля игрока: часть перекрытия гость передаёт герою.
-        // ФИКС ЗНАКОВ (наследован из CustomerCollision): раньше сдвиги были
-        // направлены ДРУГ К ДРУГУ — пара «схлопывалась», динамическое тело гостя
-        // выстреливало из геометрии, и клиент выглядел «пропавшим». Правильно:
-        // игрока толкаем ОТ гостя (-away), гостя слегка пружинит ОТ игрока (+away).
-        float requested = Mathf.Min(overlap * playerPushShare, maxPlayerPushPerStep);
-        float applied = MovePlayerSafely(player, playerCol, -away, requested);
+        // ★ Мягкое пихание: игроку уходит доля проникновения за физ-шаг,
+        // жёстко ограниченная потолком скорости. Сглаживание и проверку стен
+        // выполняет Player.ApplyCrowdPush — отсюда уходит только «запрос
+        // смещения», телепортов и рывков не бывает.
+        float pushShift = Mathf.Min(overlap * playerPushShare, maxPlayerPushPerStep);
 
-        // Всё, что игрок «не взял» (упёрся в стену/мебель/другого гостя),
-        // гость гасит отшатом — без этого он проседал бы в капсулу игрока.
-        float residual = overlap - applied;
-
-        if (residual > 0.0005f)
+        if (pushShift > 0.0005f)
         {
-            ShiftBody(away * residual);
+            player.AddCrowdPush(pushDirection, pushShift);
+        }
+
+        // Гость сам чуть-чуть уступает плечом (в сторону ОТ игрока) —
+        // остаток проникновения гасится мягче для обеих сторон.
+        float yieldShift = Mathf.Min(overlap * guestYieldShare, maxGuestYieldPerStep);
+
+        if (yieldShift > 0.0005f)
+        {
+            ShiftBody(-pushDirection * yieldShift);
         }
     }
 
     /// <summary>
-    /// Сдвиг физического тела гостя (отшат при контакте с игроком). Пишем в
+    /// Сдвиг физического тела гостя (мягкая уступка при контакте с игроком). Пишем в
     /// body.position, а не в transform: тело динамическое, запись в transform
     /// дерётся с интерполяцией и PhysX-синком. Заодно держим агента в курсе.
     /// </summary>
@@ -692,91 +1007,6 @@ public class CustomerPhysicsAgent : MonoBehaviour
         {
             agent.nextPosition = target;
         }
-    }
-
-    /// <summary>
-    /// Сдвиг игрока со страховкой: капсульный каст по направлению толкания.
-    /// Стены, мебель, дверь и другие гости гасят сдвиг — игрок не будет
-    /// вдавлен в геометрию и не окажется внутри чужой капсулы.
-    /// Возвращает фактически применённый сдвиг.
-    /// Логика перенесена из CustomerCollision.MovePlayerSafely без изменений.
-    /// </summary>
-    private float MovePlayerSafely(Player player, Collider playerCol, Vector3 direction, float shift)
-    {
-        if (shift <= 0.0001f)
-        {
-            return 0f;
-        }
-
-        CapsuleCollider capsule = playerCol as CapsuleCollider;
-
-        if (capsule == null)
-        {
-            capsule = player.GetComponentInChildren<CapsuleCollider>();
-        }
-
-        if (capsule == null)
-        {
-            // Капсулы на игроке нет — толкать нечем, контакт погасит отшат гостя.
-            return 0f;
-        }
-
-        // Капсула игрока вертикальная (ось Y), как в проекте: центр (0,1,0), рост 2.
-        float scale = Mathf.Max(
-            Mathf.Abs(capsule.transform.lossyScale.x),
-            Mathf.Abs(capsule.transform.lossyScale.z));
-        float radius = capsule.radius * scale;
-        float height = Mathf.Max(capsule.height * Mathf.Abs(capsule.transform.lossyScale.y), radius * 2f);
-        Vector3 center = capsule.transform.TransformPoint(capsule.center);
-        float half = Mathf.Max(height * 0.5f - radius, 0f);
-
-        Vector3 point1 = center + Vector3.up * half;
-        Vector3 point2 = center - Vector3.up * half;
-
-        int castHits = Physics.CapsuleCastNonAlloc(
-            point1,
-            point2,
-            radius,
-            direction,
-            castBuffer,
-            shift,
-            ~0,
-            QueryTriggerInteraction.Ignore);
-
-        float allowed = shift;
-
-        for (int i = 0; i < castHits; i++)
-        {
-            RaycastHit hit = castBuffer[i];
-
-            // NonAlloc заполняет буфер подряд; страховка от пустых записей.
-            if (hit.collider == null)
-            {
-                continue;
-            }
-
-            // Сам игрок и толкающий гость путь не перекрывают.
-            if (hit.transform.IsChildOf(player.transform))
-            {
-                continue;
-            }
-
-            if (hit.transform.IsChildOf(transform))
-            {
-                continue;
-            }
-
-            // Стена / мебель / дверь / другой гость — режем сдвиг до препятствия.
-            allowed = Mathf.Min(allowed, Mathf.Max(hit.distance - 0.005f, 0f));
-        }
-
-        if (allowed <= 0.0001f)
-        {
-            return 0f;
-        }
-
-        player.transform.position += direction * allowed;
-        return allowed;
     }
 
     /// <summary>
@@ -848,7 +1078,7 @@ public class CustomerPhysicsAgent : MonoBehaviour
         NavMeshAgent gizmoAgent = GetComponent<NavMeshAgent>();
         float guestRadius = gizmoAgent != null ? gizmoAgent.radius : 0.35f;
 
-        // Красный — радиус контакта с игроком (ближе него гость начинает толкать).
+        // Красный — радиус контакта с игроком (ближе него гость начинает пихать героя).
         Gizmos.color = new Color(1f, 0.25f, 0.15f, 0.8f);
         Gizmos.DrawWireSphere(center, (playerRadiusCache > 0f ? playerRadiusCache : 0.7f) + guestRadius);
     }

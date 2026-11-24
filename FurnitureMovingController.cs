@@ -140,6 +140,19 @@ using System.Collections.Generic;
 ///   прямой БЕЗ пересечения стены, ставится как раньше. Если цель за стеной —
 ///   призрак остаётся на последнем корректном месте и красится, а лог говорит
 ///   «сквозь стену ставить нельзя»; обойди стену и подтверждай с той стороны.
+///
+/// ★ v2.10 (запрет постановки НА ИГРОКА/СИДЯЩЕГО ГОСТЯ):
+/// - ДЫРА: игрок и клиенты сознательно исключены из проверок стен и мебели
+///   (иначе призрак замирал бы рядом с самим собой / при пробегающем мимо
+///   госте), но НИГДЕ не проверялись отдельно. Подтверждение (T) спокойно
+///   ставило станцию прямо на персонажа — и он застревал внутри её
+///   коллайдера: капсульные касты движения ловили станцию как стену со всех
+///   сторон, вылезти было нельзя.
+/// - ФИКС: IsPlacementBlocked добавил четвёртый род причин — место,
+///   пересекающее капсулу ИГРОКА или СИДЯЩЕГО гостя (тот не может уйти сам),
+///   блокируется: призрак краснеет и не подтверждается. Идущие гости мягкие
+///   (тот же критерий, что у движения игрока: CustomerPhysicsAgent без
+///   IsSeated) — они уйдут сами и перестановку не замораживают.
 /// </summary>
 public class FurnitureMovingController : MonoBehaviour
 {
@@ -232,6 +245,16 @@ public class FurnitureMovingController : MonoBehaviour
     // постановки (луч пути), — для лога причины «сквозь стену». Чистится
     // в IsPlacementBlocked, как и остальные причины.
     private Collider lastPathWallHit;
+
+    // ★ v2.10: последний коллайдер игрока или сидящего гостя, найденный
+    // проверкой постановки «на персонажа», — для лога причины. Чистится
+    // в IsPlacementBlocked, как и остальные причины.
+    private Collider lastPlayerHit;
+
+    // ★ v2.10: зазор между боксом предмета и капсулой персонажа при проверке
+    // постановки: вплотную к игроку ставить МОЖНО (касание не блокирует),
+    // пересекать его капсулу — нельзя.
+    private const float PlayerOverlapClearance = 0.05f;
 
     // ★ v2.9: высота луча проверки пути над полом (м). Стены — вертикальные
     // коллайдеры высотой ~2.5 м, игрок в этой игре живёт от пола — луч на 1 м
@@ -1071,6 +1094,14 @@ public class FurnitureMovingController : MonoBehaviour
         // стена НА ПУТИ. Формулировка зависит от того, что именно нашлось
         // (все поля чистятся в IsPlacementBlocked, поэтому «протухших»
         // значений с прошлого кадра здесь не бывает).
+        if (lastPlayerHit != null)
+        {
+            Debug.Log($"[FurnitureMoving] Здесь предмет ставить нельзя: место пересекает " +
+                      $"'{lastPlayerHit.gameObject.name}' (игрок или сидящий гость). " +
+                      "Отойди и подтверждай с другого места.");
+            return;
+        }
+
         if (lastFurnitureHit != null)
         {
             Debug.Log($"[FurnitureMoving] Место занято мебелью: '{lastFurnitureHit.gameObject.name}' " +
@@ -1516,6 +1547,7 @@ public class FurnitureMovingController : MonoBehaviour
         lastWallHit = null;
         lastFurnitureHit = null;
         lastPathWallHit = null;
+        lastPlayerHit = null;
 
         if (IsOverlappingWall(testPosition))
         {
@@ -1523,6 +1555,13 @@ public class FurnitureMovingController : MonoBehaviour
         }
 
         if (IsOverlappingOtherFurniture(testPosition))
+        {
+            return true;
+        }
+
+        // ★ v2.10: место свободно, но прямо НА персонаже (игрок или сидящий
+        // гость) — подтверждение застрелило бы его внутри коллайдера мебели.
+        if (IsOverlappingPlayerOrSeatedGuest(testPosition))
         {
             return true;
         }
@@ -1615,6 +1654,90 @@ public class FurnitureMovingController : MonoBehaviour
 
             // Всё остальное — не мебель: стены/пол/игрок/клиенты проверяет
             // IsOverlappingWall, мебельных причин у этого хита нет.
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// ★ v2.10: пересекает ли проверочный бокс предмета в позиции testPosition
+    /// коллайдер ИГРОКА или СИДЯЩЕГО гостя. ФИКС «поставил станцию на себя —
+    /// и застрял»: из проверок стен и мебели персонажи исключены сознательно
+    /// (призрак не должен замирать у самого игрока и при пробегающем госте),
+    /// но без отдельной проверки подтверждение (T) ставило мебель прямо на
+    /// персонажа, и он оказывался заперт внутри её коллайдера. Теперь такое
+    /// место блокируется: призрак краснеет, T-гейт отказывает, лог называет
+    /// причину. Зазор PlayerOverlapClearance — вплотную ставить можно, только
+    /// НАКРЫВАТЬ нельзя. Идущие гости мягкие (тот же критерий, что у движения
+    /// игрока: CustomerPhysicsAgent без IsSeated) — они уйдут сами, их место
+    /// не занимает.
+    /// </summary>
+    private bool IsOverlappingPlayerOrSeatedGuest(Vector3 testPosition)
+    {
+        lastPlayerHit = null;
+
+        if (!wallBoxValid || movingCounter == null)
+        {
+            return false;
+        }
+
+        Vector3 half = wallBoxHalfExtents;
+        half.x = Mathf.Max(0.01f, half.x - PlayerOverlapClearance);
+        half.y = Mathf.Max(0.01f, half.y - PlayerOverlapClearance);
+        half.z = Mathf.Max(0.01f, half.z - PlayerOverlapClearance);
+
+        // Тот же поворотозависимый бокс, что у проверок стен и мебели.
+        Quaternion boxRotation = GetCurrentBoxRotation();
+        Vector3 center = testPosition + boxRotation * wallBoxOffset;
+
+        int hitCount = Physics.OverlapBoxNonAlloc(
+            center,
+            half,
+            wallOverlapBuffer,
+            boxRotation,
+            ~0, // все слои — коллайдер персонажа может лежать на любом
+            QueryTriggerInteraction.Ignore);
+
+        // ★ Кламп: NonAlloc возвращает общее число попаданий, которое может
+        // превысить длину буфера (лишние не записываются).
+        int resultCount = Mathf.Min(hitCount, wallOverlapBuffer.Length);
+
+        for (int i = 0; i < resultCount; i++)
+        {
+            Collider hit = wallOverlapBuffer[i];
+
+            if (hit == null)
+            {
+                break;
+            }
+
+            // Свой предмет целиком (страховка: коллайдеры выключены, но мало ли).
+            if (IsOwnCollider(hit) || hit.transform.IsChildOf(movingCounter.transform))
+            {
+                continue;
+            }
+
+            // Игрок: мебель, накрывшая игрока, запирает его внутри коллайдера.
+            if (hit.GetComponentInParent<Player>() != null)
+            {
+                lastPlayerHit = hit;
+                return true;
+            }
+
+            // Сидящий гость (и legacy-гость без агента) не может уйти сам —
+            // накрывать его мебелью нельзя. Идущий гость мягкий: уйдёт сам.
+            CustomerAI guest = hit.GetComponentInParent<CustomerAI>();
+
+            if (guest != null)
+            {
+                CustomerPhysicsAgent guestAgent = guest.GetComponent<CustomerPhysicsAgent>();
+
+                if (guestAgent == null || guestAgent.IsSeated)
+                {
+                    lastPlayerHit = hit;
+                    return true;
+                }
+            }
         }
 
         return false;

@@ -83,6 +83,12 @@ public class BodyPusher : MonoBehaviour
         // Своё (иерархия игрока) не толкаем
         if (body.transform == transform || body.transform.IsChildOf(transform)) return;
 
+        // ★ Гость — не «толкаемый объект»: игрок проходит сквозь толпу мягко
+        // (Player.HandleMovement + CustomerPhysicsAgent), резкий импульс швырял бы
+        // гостей в стороны и ломал это ощущение. Двери на петлях, ящики, стулья
+        // работают как раньше.
+        if (body.GetComponentInParent<CustomerAI>() != null) return;
+
         // 2. Кулдаун — иначе импульс копится каждый кадр и дверь улетает
         if (Time.time - lastPushTime < pushInterval) return;
         lastPushTime = Time.time;

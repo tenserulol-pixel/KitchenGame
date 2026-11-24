@@ -10,6 +10,8 @@ using System.Collections.Generic;
 /// 2) Когда текущий список совпадает с inputs какого-то рецепта → переходим в ReadyToStir.
 /// 3) Игрок зажимает F (InteractAlternate) — SetStirringState(true) вызывается из Player.Update().
 ///    Состояние Stirring, прогресс stirring растёт (умножается на «Быстрый огонь»).
+///    У станции «Самомешающий котёл» (autoStir в инспекторе) перемешивание идёт
+///    САМО со скоростью autoStirSpeed от ручной; зажатие F игроком ускоряет до полной.
 /// 4) При достижении stirringRequired:
 ///    - если pendingExtraStirs > 0 (карта «Нестабильный котёл») — цикл перемешивания повторяется;
 ///    - иначе → Brewing: автоматическая варка (тоже ускоряется «Быстрым огнём»),
@@ -67,6 +69,15 @@ public class StoveCounter : BaseCounter, IHasProgress
     // идемпотентен, поэтому безопасно вызывать его повторно при восстановлении сохранения.
     private bool isEternalFireUpgraded = false;
 
+    [Header("Станция «Самомешающий котёл» (автопомешивание)")]
+    [Tooltip("Включить на ОТДЕЛЬНОМ префабе для нового товара лавки: котёл мешает зелье сам, " +
+             "без зажатия F игроком. Ручное перемешивание по-прежнему работает и идёт на полной скорости.")]
+    [SerializeField] private bool autoStir = false;
+    [Tooltip("Скорость автопомешивания как доля ручной (0.5 = вдвое медленнее держания F). " +
+             "Ручная скорость учитывает «Быстрый огонь», «Вечный огонь» и карты; " +
+             "пока игрок держит F, автопомешивание вытесняется полной ручной скоростью.")]
+    [SerializeField, Range(0.1f, 1f)] private float autoStirSpeed = 0.5f;
+
     // Нестабильный котёл: сколько доп. перемешиваний осталось до варки (берётся
     // из UpgradeManager при подборе рецепта в котёл).
     private int pendingExtraStirs = 0;
@@ -112,8 +123,9 @@ public class StoveCounter : BaseCounter, IHasProgress
                 break;
 
             case State.ReadyToStir:
-                // Если игрок зажал F (флаг установлен через SetStirringState) — переходим в Stirring
-                if (isPlayerStirring)
+                // Если игрок зажал F (флаг установлен через SetStirringState) — переходим в Stirring.
+                // Самомешающий котёл (autoStir) начинает мешать сам, без игрока.
+                if (isPlayerStirring || autoStir)
                 {
                     state = State.Stirring;
                     NotifyStateChanged();
@@ -121,11 +133,14 @@ public class StoveCounter : BaseCounter, IHasProgress
                 break;
 
             case State.Stirring:
-                // Прогресс перемешивания растёт только если игрок держит F.
-                // Быстрый огонь: скорость умножается на кулинарный множитель.
-                if (isPlayerStirring && activeRecipe != null)
+                // Прогресс перемешивания растёт, если игрок держит F, ИЛИ котёл —
+                // «Самомешающий» (autoStir). Скорость: ручная полная (кул. множитель ×
+                // «Вечный огонь»); авто — та же база, умноженная на долю autoStirSpeed.
+                // Пока игрок держит F, ручная скорость вытесняет авто.
+                if ((isPlayerStirring || autoStir) && activeRecipe != null)
                 {
-                    stirringProgress += Time.deltaTime * GetCookSpeed();
+                    float stirSpeed = GetCookSpeed() * (isPlayerStirring ? 1f : autoStirSpeed);
+                    stirringProgress += Time.deltaTime * stirSpeed;
                     NotifyProgressChanged(stirringProgress / activeRecipe.stirringRequired);
 
                     if (stirringProgress >= activeRecipe.stirringRequired)
@@ -144,7 +159,7 @@ public class StoveCounter : BaseCounter, IHasProgress
                         }
                     }
                 }
-                // Если отпустил — остаёмся в Stirring, прогресс сохраняется
+                // Если отпустил (и автопомешивания нет) — остаёмся в Stirring, прогресс сохраняется
                 break;
 
             case State.Brewing:
